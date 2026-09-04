@@ -1,0 +1,17 @@
+# TensorRT engines and exported ONNX weights: GB-scale and machine/GPU-specific,
+# rebuilt locally with occlusion_recovery/export_tokenhmr_trt.py
+occlusion_recovery/engines/
+
+# Downloaded model assets
+occlusion_recovery/models/
+
+# Run logs and profiling output
+occlusion_recovery/outputs/
+
+# Upstream clones (TokenHMR etc.) -- fetched separately, not vendored here
+third_party/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
