@@ -26,8 +26,15 @@ Engines:
 # in the same process -- measured on an Orin, `fit` went 41.2 -> 8.3 ms and the
 # mesh rate 8.9 -> 14.9 Hz purely from capping this, with the GPU inference
 # itself unchanged (33.3 vs 33.1 ms).  Set before torch is imported.
+#
+# One thread, not a few: the pool earns nothing at any size (frame_total 70.1 ms
+# with four threads, 69.5 with one) while the three extra threads each sat at
+# ~85% -- 2.5 cores of waste.  OMP_WAIT_POLICY=PASSIVE does not change that, so
+# they are doing real work, just work worth nothing to a GPU-resident model.
+# Those cores are better left to whatever else the robot is running: TokenHMR
+# went from 5.9 to 1.3 cores with the frame time unchanged.
 import os
-os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import sys, types, argparse, time
 from pathlib import Path
@@ -36,7 +43,7 @@ import torch
 
 # Belt and braces: OMP_NUM_THREADS only takes effect if it is set before the
 # OpenMP runtime initialises, which a different entry point might not honour.
-torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "4")))
+torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "1")))
 
 import live_pipeline as PIPE    # full pipeline: viz, ROS, threading, SMPL maths
 
