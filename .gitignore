@@ -8,8 +8,11 @@ occlusion_recovery/models/
 # Run logs and profiling output
 occlusion_recovery/outputs/
 
-# Upstream clones (TokenHMR etc.) -- fetched separately, not vendored here
-third_party/
+# TokenHMR is an unmodified upstream clone plus multi-GB checkpoints; fetch it
+# with the command in occlusion_recovery/README.md rather than tracking it.
+# Fast-SAM-3D-Body is a submodule (see .gitmodules) because it carries our own
+# worker and Jetson fixes.
+third_party/TokenHMR/
 
 __pycache__/
 *.py[cod]
