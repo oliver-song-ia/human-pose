@@ -10,8 +10,7 @@ surface refine -> Open3D):
   separate-environment ZMQ worker
 
 `live_pipeline.py` is the shared pipeline; a launcher binds `load_model` /
-`run_model` and calls `main()`. See `PIPELINE.md` for details
-and `LIVE_MESH_OPTIMIZATION_NOTES.md` for the latency work.
+`run_model` and calls `main()`. See `PIPELINE.md` for details.
 
 ## Getting the dependencies
 
