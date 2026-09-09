@@ -26,11 +26,17 @@ import zmq
 import live_pipeline as PIPE
 import mesh_live_o3d as ML
 
-FAST_ROOT = Path("/media/oliver/9a72b131-ff4a-4fc1-a6d5-53ef9c8524e1/code/Fast-SAM-3D-Body")
+FAST_ROOT = Path(os.environ.get(
+    "FAST_SAM_3D_ROOT",
+    "/media/oliver/9a72b131-ff4a-4fc1-a6d5-53ef9c8524e1/code/Fast-SAM-3D-Body"))
 WORKER = FAST_ROOT / "ros_realtime/mesh_worker.py"
 sys.path.insert(0, str(FAST_ROOT))  # shared length-prefixed ZMQ wire helper
-YOLO_ENGINE = Path("/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903_rtx4070.engine")
-YOLO_PT = Path("/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903.pt")
+YOLO_ENGINE = Path(os.environ.get(
+    "HUMAN_POSE_YOLO",
+    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903_rtx4070.engine"))
+YOLO_PT = Path(os.environ.get(
+    "HUMAN_POSE_YOLO_PT",
+    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903.pt"))
 MESH_VIS = np.array([0.10, 0.85, 0.55])
 MESH_HID = np.array([0.20, 0.24, 0.42])
 TOKEN_VIS = np.array([1.00, 0.35, 0.05])
@@ -60,12 +66,24 @@ def start_worker(frames_endpoint, results_endpoint, layer_dtype, image_size,
     # (USE_COMPILE, MHR_USE_CUDA_GRAPH, BODY_INTERM_PRED_LAYERS, ...), so let the
     # caller append or override any of them without editing this launcher.
     overrides = "".join(f"export {kv}\n" for kv in extra_env)
+    # The worker needs an interpreter that can import sam_3d_body.  By default
+    # that is the project's conda env; FAST_SAM_3D_PYTHON names an interpreter
+    # directly instead, which is how a machine without conda (a Jetson, say)
+    # runs the worker out of a plain venv.
+    worker_python = os.environ.get("FAST_SAM_3D_PYTHON", "")
+    if worker_python:
+        env_setup = ""
+    else:
+        # conda's nvidia pip wheels ship their CUDA libs outside the linker path
+        env_setup = (
+            "source /home/oliver/anaconda3/etc/profile.d/conda.sh\n"
+            "conda activate fast_sam_3d_body\n"
+            "NVLIBS=$(find \"$CONDA_PREFIX/lib/python3.11/site-packages/nvidia\" "
+            "-mindepth 2 -maxdepth 2 -type d -name lib -printf '%p:' 2>/dev/null)\n"
+            "export LD_LIBRARY_PATH=\"${NVLIBS}${LD_LIBRARY_PATH:-}\"\n")
+        worker_python = "python"
     command = f"""
-source /home/oliver/anaconda3/etc/profile.d/conda.sh
-conda activate fast_sam_3d_body
-NVLIBS=$(find "$CONDA_PREFIX/lib/python3.11/site-packages/nvidia" -mindepth 2 -maxdepth 2 -type d -name lib -printf '%p:' 2>/dev/null)
-export LD_LIBRARY_PATH="${{NVLIBS}}${{LD_LIBRARY_PATH:-}}"
-export GPU_HAND_PREP=1 LAYER_DTYPE={layer_dtype} SKIP_KEYPOINT_PROMPT=1 IMG_SIZE={image_size}
+{env_setup}export GPU_HAND_PREP=1 LAYER_DTYPE={layer_dtype} SKIP_KEYPOINT_PROMPT=1 IMG_SIZE={image_size}
 # CUDA graphs measured at -2.4 ms on the body decoder (24.15 -> 21.70) with an
 # unchanged numerical path; revert with --worker-env MHR_USE_CUDA_GRAPH=0.
 # USE_COMPILE stays 0: the estimator's multi-person compile warmup feeds the
@@ -74,7 +92,7 @@ export USE_COMPILE=0 MHR_USE_CUDA_GRAPH=1 KEYPOINT_PROMPT_INTERM_INTERVAL=999
 export BODY_INTERM_PRED_LAYERS=0,1,2 MHR_NO_CORRECTIVES=1
 {trt_env}
 {overrides}cd {FAST_ROOT!s}
-exec python {WORKER!s} --external-boxes --no-overlay {quiet} --reliable --frames-endpoint {frames_endpoint} --results-endpoint {results_endpoint}
+exec {worker_python} {WORKER!s} --external-boxes --no-overlay {quiet} --reliable --frames-endpoint {frames_endpoint} --results-endpoint {results_endpoint}
 """
     log = open("/tmp/fastsam3d_rgbd_worker.log", "w", buffering=1)
     return subprocess.Popen(["bash", "-lc", command], stdout=log,
@@ -140,31 +158,6 @@ def build_mesh(verts, faces, visible, visible_color=MESH_VIS,
         mesh.compute_vertex_normals()
         out.append(mesh)
     return tuple(out)
-
-
-def build_cloud(depth, rgb, K, stride=6, exclude_mask=None):
-    """Backproject scene depth, optionally removing the detected person.
-
-    The camera only measures the person's front surface.  Leaving those points
-    in the context cloud makes them appear as dots over the predicted back when
-    the user rotates the Open3D view, which is visually misleading.
-    """
-    h, w = depth.shape
-    ys, xs = np.mgrid[0:h:stride, 0:w:stride].reshape(2, -1)
-    z = depth[ys, xs]
-    keep = (z > PIPE.MINZ) & (z < PIPE.MAXZ)
-    if exclude_mask is not None and exclude_mask.shape == depth.shape:
-        keep &= ~exclude_mask[ys, xs]
-    xs, ys, z = xs[keep], ys[keep], z[keep]
-    x = (xs - K[0, 2]) * z / K[0, 0]
-    y = (ys - K[1, 2]) * z / K[1, 1]
-    xyz = np.stack([x, y, z], axis=1)
-    col = rgb[ys, xs].astype(np.float32) / 255.0
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(np.ascontiguousarray(xyz * FLIP, np.float64))
-    pcd.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(
-        np.clip(col * PIPE.CLOUD_GAIN + PIPE.CLOUD_LIFT, 0.0, 1.0), np.float64))
-    return pcd
 
 
 def build_skeleton(joints):
@@ -286,6 +279,18 @@ def main():
     ap.add_argument("--no-yolo-window", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--with-tokenhmr", action="store_true",
                     help="overlay TokenHMR (orange) with Fast SAM 3D (green)")
+    ap.add_argument("--seg-hz", type=float, default=8.0,
+                    help="detection rate for the picker panel; lower leaves more "
+                         "GPU for the mesh model")
+    ap.add_argument("--seg-pick", action="store_true",
+                    help="show every detected person in the mask window and fit "
+                         "the one you click (implies --yolo-window)")
+    ap.add_argument("--hide-person-cloud", action="store_true",
+                    help="drop the measured person points instead of emphasising "
+                         "them (they can be mistaken for the predicted back)")
+    ap.add_argument("--person-cloud-stride", type=int, default=2,
+                    help="sampling stride for the person surface; finer than the "
+                         "room so the measured body reads clearly (0 = same)")
     ap.add_argument("--run-seconds", type=float, default=0.0,
                     help="close the window automatically after N seconds so a "
                          "latency run is reproducible without hand timing")
@@ -307,6 +312,8 @@ def main():
     ap.add_argument("--full-frame-worker-input", action="store_true",
                     help="send the full RGB frame to Fast SAM (compatibility/debug fallback)")
     args = ap.parse_args()
+    if args.seg_pick:
+        args.yolo_window = True          # the picker needs its window
     if not 0.0 < args.mesh_ema_alpha <= 1.0:
         ap.error("--mesh-ema-alpha must be in (0, 1]")
     if args.fast_image_size != 384 and not args.disable_fast_trt:
@@ -336,6 +343,11 @@ def main():
     yolo_path = YOLO_ENGINE if YOLO_ENGINE.exists() else YOLO_PT
     yolo = YOLO(str(yolo_path))
     person_cls = next((i for i, n in yolo.names.items() if str(n).lower() == "person"), 0)
+    direct_yolo = None
+    if PIPE.YOLO_DIRECT and str(yolo_path).endswith(".engine"):
+        from yolo_trt_runtime import YoloSegTRT
+        direct_yolo = YoloSegTRT(str(yolo_path), conf=0.25, person_class=person_cls)
+        print("YOLO: direct TensorRT runner (ultralytics wrapper bypassed)", flush=True)
 
     import rclpy
     from sensor_msgs.msg import CameraInfo, Image
@@ -348,7 +360,9 @@ def main():
              "token_mesh": None, "token_mesh_stamp": None, "cloud": None,
              "skeleton": None,
              "profile": None, "error": None, "person_detected": False,
-             "yolo_viz": None, "cloud_exclude_mask": None, "sensor_lag": None,
+             "yolo_viz": None, "seg_det": None, "seg_stamp": 0,
+             "cloud_exclude_mask": None, "person_mask": None,
+             "sensor_lag": None,
              "profile_rows": []}      # unified latency rows (see PIPE.UNIFIED_KEYS)
 
     def on_rgb(m):
@@ -375,6 +389,21 @@ def main():
         """
         period = 1.0 / max(args.cloud_hz, 1.0)
         last_stamp = 0
+        seg_yolo = None
+        # The panel exists so a human can see and click people; 8 Hz is plenty
+        # for that, and every extra detection contends with Fast SAM for the
+        # GPU (measured: 15 Hz panel pushed the mesh from 335 to 480 ms).
+        seg_period = 1.0 / max(args.seg_hz, 0.5)
+        last_seg = 0.0
+        if args.seg_pick and direct_yolo is not None:
+            # The picker panel must not run at the mesh rate: Fast SAM takes
+            # ~300 ms per frame, so a panel driven by the inference loop updates
+            # 3x a second and feels frozen while you are trying to click a
+            # moving person.  Give it its own detector on the cloud thread,
+            # which already runs at ~15 Hz on freshly decoded frames.
+            from yolo_trt_runtime import YoloSegTRT
+            seg_yolo = YoloSegTRT(str(yolo_path), conf=0.25,
+                                  person_class=person_cls)
         while state["running"]:
             started = time.monotonic()
             rgb_msg, dep_msg, K, stamp = state["rgb"], state["depth"], state["K"], state["stamp"]
@@ -382,10 +411,37 @@ def main():
                     and stamp != last_stamp):
                 last_stamp = stamp
                 rgb = decode(rgb_msg)
+                now_seg = time.monotonic()
+                if seg_yolo is not None and now_seg - last_seg >= seg_period:
+                    last_seg = now_seg
+                    t_seg = time.perf_counter()
+                    seg_people = seg_yolo(rgb, all_people=True)
+                    # Resolve the click here so the selection reacts at panel
+                    # rate; the inference loop reads the resulting target.
+                    seg_chosen = PIPE.pick_person(seg_people)
+                    state["yolo_viz"] = PIPE.build_seg_view_multi(
+                        rgb, seg_people, seg_chosen,
+                        (time.perf_counter() - t_seg) * 1000)
+                    # Publish it for the inference loop: running a second
+                    # detector there would double the YOLO work and the two
+                    # engines would contend for the GPU (measured: mesh
+                    # 335 -> 480 ms).  One detection per frame, shared.
+                    state["seg_det"] = (
+                        (seg_people[seg_chosen][0], seg_people[seg_chosen][1])
+                        if seg_chosen is not None else None)
+                    state["seg_stamp"] = stamp
+                    # Emphasise the person actually being fitted, updated at
+                    # panel rate so the highlight follows a click immediately.
+                    state["person_mask"] = (seg_people[seg_chosen][1]
+                                            if seg_chosen is not None else None)
                 depth = decode(dep_msg).astype(np.float32) * 0.001
                 if rgb.shape[:2] == depth.shape:
-                    state["cloud"] = build_cloud(
-                        depth, rgb, K, exclude_mask=state["cloud_exclude_mask"])
+                    # Same builder as the TokenHMR demo, so both look identical.
+                    state["cloud"], _ = PIPE.build_scene_cloud(
+                        depth, rgb, K,
+                        person_mask=(None if args.hide_person_cloud
+                                     else state["person_mask"]),
+                        person_stride=args.person_cloud_stride)
             time.sleep(max(0.0, period - (time.monotonic() - started)))
 
     def inference_loop():
@@ -470,21 +526,39 @@ def main():
                 t_dispatch = time.perf_counter(); dispatch_ms = (t_dispatch-d0)*1000
                 last_send = time.monotonic()
             t_yolo0 = time.perf_counter()
-            # predict, not track: `largest_person` ranks by box area and no track
-            # id is read anywhere downstream, so ByteTrack was pure overhead.
-            res = yolo.predict(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-                               classes=[person_cls], conf=0.25, verbose=False)[0]
-            yolo_speed = getattr(res, "speed", None) or {}
-            t_yolo = time.perf_counter()
-            det = PIPE.largest_person(res, rgb.shape[:2])
+            people = None
+            if args.seg_pick:
+                # Reuse the detection the panel thread already made for this
+                # frame -- it runs at cloud rate on the same images, so the mesh
+                # loop pays no YOLO cost at all here.
+                people = []                       # marks "panel owns the view"
+                det = state["seg_det"]
+                yolo_speed = {}
+                t_yolo = time.perf_counter()
+            elif direct_yolo is not None:
+                # Straight to TensorRT: RGB in, (box, mask) out.  Ultralytics'
+                # wrapper costs 0.2 ms on an RTX 4070 but tens of ms on a Jetson.
+                det = direct_yolo(rgb)
+                yolo_speed = {}
+                t_yolo = time.perf_counter()
+            else:
+                # predict, not track: `largest_person` ranks by box area and no
+                # track id is read anywhere downstream, so ByteTrack was overhead.
+                res = yolo.predict(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                                   classes=[person_cls], conf=0.25, verbose=False)[0]
+                yolo_speed = getattr(res, "speed", None) or {}
+                t_yolo = time.perf_counter()
+                det = PIPE.largest_person(res, rgb.shape[:2])
             if det is None:
                 detection_misses += 1
-                state["yolo_viz"] = build_yolo_debug(rgb, None, detection_misses)
+                if people is None:
+                    state["yolo_viz"] = build_yolo_debug(rgb, None, detection_misses)
                 if detection_misses == args.detection_miss_limit:
                     state["person_detected"] = False
                     state["mesh"] = None
                     state["token_mesh"] = None
                     state["cloud_exclude_mask"] = None
+                    state["person_mask"] = None
                     ema = token_ema = None
                     prev_box = None     # re-anchor the crop on the next detection
                     print(f"person detection lost for {detection_misses} consecutive "
@@ -495,12 +569,14 @@ def main():
                       flush=True)
             detection_misses = 0
             state["person_detected"] = True
-            state["yolo_viz"] = build_yolo_debug(rgb, det, 0)
+            if people is None:
+                state["yolo_viz"] = build_yolo_debug(rgb, det, 0)
             box, mask = det
             prev_box = box
             # Dilate slightly to cover segmentation erosion and inter-frame
             # motion before removing the observed front-surface person points.
-            state["cloud_exclude_mask"] = cv2.dilate(
+            state["person_mask"] = np.asarray(mask, bool)
+            state["cloud_exclude_mask"] = None if not args.hide_person_cloud else cv2.dilate(
                 np.asarray(mask, np.uint8), np.ones((11, 11), np.uint8),
                 iterations=1).astype(bool)
             t_detect = time.perf_counter()
@@ -703,7 +779,11 @@ def main():
         """Upload only the newest producer result on the Open3D GUI thread."""
         try:
             if args.yolo_window and not args.no_yolo_window and state["yolo_viz"] is not None:
-                cv2.imshow("YOLO person mask -> Fast SAM", state["yolo_viz"])
+                title = "YOLO person mask -> Fast SAM"
+                cv2.imshow(title, state["yolo_viz"])
+                if args.seg_pick and not gui_state.get("seg_cb"):
+                    cv2.setMouseCallback(title, PIPE._on_seg_click)
+                    gui_state["seg_cb"] = True
                 cv2.waitKey(1)
             if state["cloud"] is not None:
                 cloud = state["cloud"]

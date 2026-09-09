@@ -29,19 +29,61 @@ import torch
 
 # Filled by the bound run_model when detailed live profiling is enabled.
 MODEL_PROFILE = {}
+# Optional: a model that predicts its own camera translation fills this in (see
+# mesh_live_o3d.run_tokenhmr).  None means "no such estimate, use depth alone".
+MODEL_CAM_T = None
 import open3d as o3d
 from scipy.spatial import cKDTree
 
 HP = "/media/oliver/9a72b131-ff4a-4fc1-a6d5-53ef9c8524e1/code/human-pose"
-YOLO_PT = "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903.pt"
-YOLO_ENGINE = "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903_rtx4070.engine"
+# A TensorRT engine is tied to one GPU architecture AND one TensorRT version,
+# so every machine needs its own; HUMAN_POSE_YOLO / _PT point at the local ones.
+YOLO_PT = os.environ.get(
+    "HUMAN_POSE_YOLO_PT",
+    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903.pt")
+YOLO_ENGINE = os.environ.get(
+    "HUMAN_POSE_YOLO",
+    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903_rtx4070.engine")
 YOLO_MODEL = YOLO_ENGINE if Path(YOLO_ENGINE).exists() else YOLO_PT
+# The engine is driven through yolo_trt_runtime rather than ultralytics: the
+# wrapper costs 0.2 ms on an RTX 4070 but 20-30 ms on a Jetson, where the host
+# side is the bottleneck rather than the GPU.  Measured in this pipeline on an
+# AGX Orin, `detect` went 36.8 -> 17.5 ms.  Set HUMAN_POSE_YOLO_DIRECT=0 to fall
+# back to ultralytics (needed for a .pt model, which has no engine to drive).
+YOLO_DIRECT = os.environ.get("HUMAN_POSE_YOLO_DIRECT", "1") == "1"
 
 FLIP_TEST = False        # 2nd flipped forward pass: +accuracy, ~2x slower. off = live
 TEMPORAL_SMOOTHING = True
 HOLD_BODY_PARTS = True
 FAST_VISIBILITY = False
-ROOT_OFFSET = 0.10       # pelvis sits ~10cm behind the front torso skin the depth sees
+# Also treat a vertex as hidden when the depth sensor measured a surface well in
+# front of it (a chair, a desk).  Without this the two-tone mesh only encodes
+# self-occlusion, so a back behind a chair still reads as camera-visible.
+#
+# OFF by default: it is only meaningful once the mesh actually sits on the
+# observed surface.  Measured on a seated person, the grounded mesh is a median
+# 0.32 m behind the depth the sensor reports along the same ray (and only 20% of
+# its vertices even land inside the person mask), so this test currently calls
+# ~64% of the body "occluded" -- it would be reporting the misalignment, not the
+# chair.  Fix the placement first, then turn this on.
+EXTERNAL_OCCLUSION = False
+# Blend the model's own camera translation into the depth-derived root (see
+# blend_root).  0.0 = depth only (the old behaviour), 1.0 = trust the model.
+MODEL_ROOT_BLEND = True
+MODEL_ROOT_ALPHA = 0.5
+# How far the pelvis sits behind the skin the depth camera actually sees.  This
+# depends on which way the body faces: head-on the sensor sees the chest/belly
+# and the pelvis is ~10 cm behind it, but in profile it sees the side of the
+# torso, only ~5 cm out from the centre line.  Holding the frontal value through
+# a turn pushes the root to the wrong depth -- visible as the mesh jumping as
+# someone rotates.  ORIENT_ROOT_OFFSET interpolates by |cos(angle between the
+# body's forward axis and the camera axis)|; set it False for the old constant.
+ROOT_OFFSET = 0.10       # facing the camera: pelvis ~10cm behind the front skin
+ROOT_OFFSET_PROFILE = 0.05   # side-on: half the torso width, not its depth
+ORIENT_ROOT_OFFSET = True
+# Reject physically impossible root jumps (see RootStabiliser).  0 disables it.
+MAX_ROOT_SPEED = 3.0     # m/s
+ROOT_JUMP_GRACE = 3      # consecutive outlier frames before the jump is accepted
 ICP_MAX_POINTS = 6000    # observed-cloud cap for the depth z-fit (see refine_to_cloud)
 MINZ, MAXZ = 0.3, 5.0
 # Cloud vs mesh trade-off (single GPU): the decoupled cloud thread streams point
@@ -95,6 +137,23 @@ COMPARE_FACES = None
 COMPARE_NAME = None
 COMPARE_OFFSET_X = 1.15       # metres in camera coordinates (displayed side-by-side)
 DISPLAY_MODEL_NAME = "Mesh"
+RUN_SECONDS = 0.0        # >0: close the window automatically after N seconds
+# Side window showing the segmentation actually driving the fit.  The Open3D
+# scene shows the result; this shows the evidence, which is what you need when
+# the mesh misbehaves (bad mask vs bad model).  Scaled down so it sits beside
+# the 3D view rather than covering it.
+SEG_VIEW = False
+SEG_VIEW_WIDTH = 480
+# Click a person in the segmentation window to fit that one instead of whichever
+# happens to be largest.  Selection persists across frames by tracking the box
+# centre, so it survives the target being briefly overtaken or occluded.
+SEG_PICK = False
+PICK_STATE = {"target": None,    # (cx, cy) of the chosen person, source pixels
+              "click": None,     # pending click from the GUI thread
+              "people": None,    # candidates of the last frame, for hit-testing
+              "scale": 1.0}
+PICK_MAX_DRIFT = 0.35            # max centre move between frames, as a fraction
+                                 # of the box diagonal, before the lock is lost
 
 # Body-facing indicator.  SMPL's labelled left/right torso joints remove the
 # 180-degree ambiguity that a plain person bounding box has: anatomical forward
@@ -111,9 +170,12 @@ FACING_ARROW_LENGTH = 0.42
 #         -> (verts[6890,3] metric root-rel, joints[24,3], pelvis_px[2], sigma|None)
 load_model = None
 run_model = None
+# Optional: a launcher may bind this so losing the person also drops any
+# temporally-smoothed body-shape estimate (see mesh_live_o3d.reset_betas_state).
+reset_shape_state = None
 
 
-def metric_root(pelvis_px, depth_m, K, mask):
+def metric_root(pelvis_px, depth_m, K, mask, root_offset=None):
     """Sensor-grounded 3D pelvis: depth at the pelvis pixel (median in a window,
     inside the mask), backprojected with the real K, pushed ROOT_OFFSET behind
     the observed front surface. Falls back to whole-mask median depth."""
@@ -132,10 +194,67 @@ def metric_root(pelvis_px, depth_m, K, mask):
             return None
         z = float(np.median(d))
         u, v = pelvis_px                       # keep XY from the projected pelvis
-    zr = z + ROOT_OFFSET
+    zr = z + (ROOT_OFFSET if root_offset is None else root_offset)
     xr = (u - K[0, 2]) * zr / K[0, 0]
     yr = (v - K[1, 2]) * zr / K[1, 1]
     return np.array([xr, yr, zr], np.float32)
+
+
+def weak_persp_root(info):
+    """Weak-perspective crop translation -> pelvis position in the camera frame.
+
+    A crop-space model predicts (s, tx, ty) for a square crop, which fixes the
+    body's apparent SIZE and so its distance -- but expressed with the focal
+    length the network was trained on, over a crop of `box_size` source pixels.
+    Rescaling by (box_size / crop_px) and re-projecting through the real
+    intrinsics recovers a metric translation, the same quantity Fast SAM's
+    worker returns directly.  Returns None when the estimate is unusable.
+    """
+    if not info:
+        return None
+    ct = np.asarray(info["cam_t"], np.float64)
+    if not np.isfinite(ct).all() or ct[2] <= 1e-3:
+        return None
+    # The crop covers box_size source pixels in crop_px network pixels, so the
+    # focal length implied for the SOURCE image is scaled by that ratio.
+    src_focal = info["crop_focal"] * info["box_size"] / info["crop_px"]
+    if src_focal <= 1e-6:
+        return None
+    return ct, src_focal
+
+
+def blend_root(depth_root, cam_info, K, alpha=None):
+    """Combine the depth-derived root with the model's own camera translation.
+
+    Depth is authoritative laterally (the pelvis pixel back-projects exactly)
+    but its DEPTH relies on ROOT_OFFSET -- a fixed guess at how far the pelvis
+    sits behind the visible skin, which is what goes wrong on a seated, turned
+    or occluded person.  The model's weak-perspective translation has no such
+    assumption: it reads distance from apparent body size.  Take x, y from
+    depth and blend z, so a bad ROOT_OFFSET can no longer strand the mesh.
+    """
+    if depth_root is None:
+        return None
+    parsed = weak_persp_root(cam_info)
+    if parsed is None or not MODEL_ROOT_BLEND:
+        return depth_root
+    ct, src_focal = parsed
+    # cam_t is expressed for the network's focal length over the crop; rescale
+    # its depth to the source camera's focal length.
+    z_model = float(ct[2]) * (K[0, 0] / src_focal)
+    if not (MINZ < z_model < MAXZ):
+        return depth_root
+    a = MODEL_ROOT_ALPHA if alpha is None else alpha
+    out = np.asarray(depth_root, np.float32).copy()
+    z_depth = float(out[2])
+    z = (1.0 - a) * z_depth + a * z_model
+    # Keep x, y consistent with the new depth: the pelvis pixel is fixed, so
+    # moving along the ray means scaling the lateral offsets too.
+    if z_depth > 1e-6:
+        out[0] *= z / z_depth
+        out[1] *= z / z_depth
+    out[2] = z
+    return out
 
 
 def ground(verts, j29, root_m):
@@ -154,6 +273,13 @@ def ground(verts, j29, root_m):
 # so it must not pull the fit even when the model is confident about the head.
 SIG_W_LO, SIG_W_HI, W_FLOOR = 0.004, 0.030, 0.05     # sigma -> weight ramp (floored)
 HEAD_W = 0.10                                        # SMPL head index 15 cap (hair)
+# Shoulders (SMPL joints 16/17) are the most reliable landmark the depth camera
+# has on a turning person: they stay visible in profile, they are wide so the
+# silhouette pins them well, and unlike the head the surface the sensor sees is
+# actually the body (no hair offset).  Weighting them above the rest of the mesh
+# makes the depth fit follow them rather than the softer torso surface.
+SHOULDER_JOINTS = (16, 17)
+SHOULDER_W = 2.5             # multiplier on the base weight; 1.0 = no emphasis
 VERT_JOINT = None          # per-vertex dominant SMPL joint (6890,), set by load_model
 HEAD_CAP = None            # bool (6890,) head vertices (dominant joint 15)
 HEAD_LOCAL_REST = None     # (Nhead,3) canonical head-cap in the REST torso frame
@@ -299,6 +425,11 @@ def vertex_fit_weights(sigma):
     s = np.asarray(sigma)[:24][VERT_JOINT]                 # per-vertex sigma via dom joint
     w = np.clip((SIG_W_HI - s) / (SIG_W_HI - SIG_W_LO), W_FLOOR, 1.0)
     w[VERT_JOINT == 15] *= HEAD_W
+    if SHOULDER_W != 1.0:
+        w[np.isin(VERT_JOINT, SHOULDER_JOINTS)] *= SHOULDER_W
+    # No clamp here: W_FLOOR already floored the sigma ramp above, and only the
+    # ratios matter to refine_to_cloud's weighted median.  Re-flooring would
+    # quietly raise the deliberately-tiny head weight back to W_FLOOR.
     return w
 
 
@@ -352,7 +483,22 @@ def visible_vertices(verts, K=None, mask=None, depth_m=None, candidate_idx=None,
         bins = (v // cell) * gw + (u // cell)
         nearest = np.full(gw * gh, np.inf, np.float32)
         np.minimum.at(nearest, bins, zz)
-        return ids[zz <= nearest[bins] + 0.035]
+        front = zz <= nearest[bins] + 0.035          # mesh self-occlusion
+        if EXTERNAL_OCCLUSION and depth_m is not None:
+            # Self-occlusion alone only asks "is another part of the BODY in the
+            # way", so a back hidden behind a chair still came out green.  Compare
+            # each vertex against what the sensor actually measured along that
+            # ray: a vertex sitting well behind the measured surface has
+            # something real in front of it.
+            #
+            # Only where the depth is valid.  Holes read 0 (or beyond MAXZ) on
+            # dark, glossy and out-of-range surfaces, and treating those as
+            # "occluded" would punch spurious holes in the mesh -- which is the
+            # failure the original comment warned about.
+            d = depth_m[v, u]
+            measurable = (d > MINZ) & (d < MAXZ)
+            front &= ~(measurable & (zz > d + occlusion_margin))
+        return ids[front]
     if candidate_idx is None:
         p = o3d.geometry.PointCloud(
             o3d.utility.Vector3dVector(verts.astype(np.float64)))
@@ -555,6 +701,58 @@ def largest_person(res, hw):
     return box, mask
 
 
+class RootStabiliser:
+    """Rate-limit the metric root, so outliers cannot teleport the mesh.
+
+    The root comes from a depth median under the pelvis pixel, so it is normally
+    accurate but occasionally very wrong: the mask clips onto a wall or a chair,
+    the pelvis pixel lands on a depth hole, or the person turns and the visible
+    skin jumps to a different part of the body.  Those frames move the root by
+    far more than a person can actually move, and the mesh teleports.
+
+    A plain EMA would also lag genuine motion, which is the thing this demo has
+    to keep responsive.  So leave normal movement completely untouched and only
+    act on the impossible: anything past MAX_ROOT_SPEED for the elapsed time is
+    clamped back to the reachable sphere.  A jump that persists is accepted
+    after ROOT_JUMP_GRACE consecutive frames -- that is real motion the tracker
+    briefly lost, not an outlier, and refusing it forever would strand the mesh.
+    """
+
+    def __init__(self, max_speed=3.0, grace=3):
+        self.max_speed = float(max_speed)   # m/s, sprinting is ~10 but the root is smoother
+        self.grace = int(grace)
+        self.prev = None
+        self.prev_t = None
+        self.pending = 0
+
+    def __call__(self, root):
+        now = time.perf_counter()
+        if root is None:
+            return None
+        if self.prev is None:
+            self.prev, self.prev_t, self.pending = root.copy(), now, 0
+            return root
+        dt = max(now - self.prev_t, 1e-3)
+        step = root - self.prev
+        dist = float(np.linalg.norm(step))
+        budget = self.max_speed * dt
+        if dist <= budget:
+            self.prev, self.prev_t, self.pending = root.copy(), now, 0
+            return root
+        self.pending += 1
+        if self.pending >= self.grace:
+            # Held across several frames: treat it as real and re-seed there.
+            self.prev, self.prev_t, self.pending = root.copy(), now, 0
+            return root
+        clamped = (self.prev + step * (budget / dist)).astype(np.float32)
+        self.prev, self.prev_t = clamped.copy(), now
+        return clamped
+
+    def reset(self):
+        self.prev = self.prev_t = None
+        self.pending = 0
+
+
 class MeshEMA:
     """Light temporal smoothing on the grounded mesh + joints (the model is per-frame,
     so it jitters). Reset on lost track so it re-seeds cleanly on reappearance."""
@@ -629,6 +827,180 @@ def unified_summary(rows, model_name, warmup=5):
     print(f"  -> mesh rate {1000/np.median(a):.1f} Hz from frame_total", flush=True)
 
 
+def pick_person(people):
+    """Choose which candidate to fit: the clicked one, else the largest.
+
+    `people` is [(box, mask, conf), ...] largest first.  A pending click selects
+    whichever box contains it; after that the choice follows the nearest box
+    centre from frame to frame, so the lock survives the person being overtaken
+    in size or briefly lost.
+    """
+    if not people:
+        return None
+    boxes = np.array([p[0] for p in people], np.float64)
+    centres = np.stack([(boxes[:, 0] + boxes[:, 2]) * 0.5,
+                        (boxes[:, 1] + boxes[:, 3]) * 0.5], axis=1)
+
+    click = PICK_STATE.get("click")
+    if click is not None:
+        PICK_STATE["click"] = None
+        cx, cy = click
+        inside = ((boxes[:, 0] <= cx) & (cx <= boxes[:, 2]) &
+                  (boxes[:, 1] <= cy) & (cy <= boxes[:, 3]))
+        hit = np.flatnonzero(inside)
+        if len(hit):
+            # Smallest containing box: clicking a person standing in front of a
+            # larger one should pick the person, not the one behind.
+            areas = ((boxes[hit, 2] - boxes[hit, 0]) *
+                     (boxes[hit, 3] - boxes[hit, 1]))
+            i = int(hit[int(areas.argmin())])
+            PICK_STATE["target"] = tuple(centres[i])
+            return i
+        PICK_STATE["target"] = None       # clicked empty space -> release
+
+    target = PICK_STATE.get("target")
+    if target is None:
+        return 0                          # no pick: largest, the old behaviour
+    d = np.linalg.norm(centres - np.asarray(target, np.float64), axis=1)
+    i = int(d.argmin())
+    diag = float(np.hypot(boxes[i, 2] - boxes[i, 0], boxes[i, 3] - boxes[i, 1]))
+    if diag > 1e-6 and d[i] > PICK_MAX_DRIFT * diag:
+        PICK_STATE["target"] = None       # moved too far to still be the same person
+        return 0
+    PICK_STATE["target"] = tuple(centres[i])
+    return i
+
+
+def build_seg_view_multi(rgb, people, chosen, ms=None):
+    """Panel showing every detected person, with the fitted one highlighted."""
+    small_w = SEG_VIEW_WIDTH
+    scale = small_w / rgb.shape[1]
+    PICK_STATE["scale"] = scale
+    small_h = int(round(rgb.shape[0] * scale))
+    out = cv2.cvtColor(cv2.resize(rgb, (small_w, small_h)), cv2.COLOR_RGB2BGR)
+    if not people:
+        cv2.putText(out, "NO PERSON", (16, 42), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9, (0, 0, 255), 2, cv2.LINE_AA)
+        return out
+    for i, (box, mask, conf) in enumerate(people):
+        picked = (i == chosen)
+        m = cv2.resize(np.asarray(mask, np.uint8), (small_w, small_h),
+                       interpolation=cv2.INTER_NEAREST).astype(bool)
+        colour = (0, 255, 90) if picked else (150, 150, 150)
+        tint = np.zeros_like(out); tint[:] = colour
+        a = 0.45 if picked else 0.22
+        out[m] = ((1 - a) * out[m] + a * tint[m]).astype(np.uint8)
+        x1, y1, x2, y2 = (np.rint(np.asarray(box, np.float64) * scale)).astype(int)
+        cv2.rectangle(out, (x1, y1), (x2, y2),
+                      (0, 255, 255) if picked else (120, 120, 120),
+                      2 if picked else 1)
+        tag = f"{'FIT' if picked else str(i)} {conf:.2f}"
+        cv2.putText(out, tag, (x1 + 3, max(y1 - 5, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 255, 255) if picked else (170, 170, 170), 1, cv2.LINE_AA)
+    locked = PICK_STATE.get("target") is not None
+    bar = f"{len(people)} person(s)   {'LOCKED - click elsewhere to release' if locked else 'click a person to fit them'}"
+    if ms is not None:
+        bar += f"   detect {ms:.0f} ms"
+    cv2.rectangle(out, (0, 0), (small_w, 24), (0, 0, 0), -1)
+    cv2.putText(out, bar, (8, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                (0, 255, 255) if locked else (220, 220, 220), 1, cv2.LINE_AA)
+    return out
+
+
+def _on_seg_click(event, x, y, flags, param):
+    if event == cv2.EVENT_LBUTTONDOWN:
+        sc = PICK_STATE.get("scale", 1.0) or 1.0
+        PICK_STATE["click"] = (x / sc, y / sc)      # back to source pixels
+
+
+def build_seg_view(rgb, det, ms=None):
+    """BGR panel of the person mask + box that this frame's fit is using."""
+    small_w = SEG_VIEW_WIDTH
+    scale = small_w / rgb.shape[1]
+    small_h = int(round(rgb.shape[0] * scale))
+    out = cv2.cvtColor(cv2.resize(rgb, (small_w, small_h)), cv2.COLOR_RGB2BGR)
+    if det is None:
+        cv2.putText(out, "NO PERSON", (16, 34), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9, (0, 0, 255), 2, cv2.LINE_AA)
+        return out
+    box, mask = det
+    m = np.asarray(mask, dtype=bool)
+    if m.shape != rgb.shape[:2]:
+        return out
+    ms_small = cv2.resize(m.astype(np.uint8), (small_w, small_h),
+                          interpolation=cv2.INTER_NEAREST).astype(bool)
+    tint = np.zeros_like(out); tint[..., 1] = 255
+    out[ms_small] = (0.55 * out[ms_small] + 0.45 * tint[ms_small]).astype(np.uint8)
+    x1, y1, x2, y2 = (np.rint(np.asarray(box, np.float64) * scale)).astype(int)
+    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
+    label = "PERSON MASK" if ms is None else f"PERSON MASK  detect {ms:.0f} ms"
+    cv2.rectangle(out, (0, 0), (small_w, 26), (0, 0, 0), -1)
+    cv2.putText(out, label, (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (0, 255, 255), 1, cv2.LINE_AA)
+    return out
+
+
+# Emphasis for the person being fitted: the measured surface is the ground truth
+# the predicted mesh is judged against, so it is sampled finer and kept at full
+# colour while the room behind it is dimmed to context.
+PERSON_CLOUD_STRIDE = 3
+PERSON_CLOUD_GAIN, PERSON_CLOUD_LIFT = 1.05, 0.05
+ROOM_CLOUD_GAIN, ROOM_CLOUD_LIFT = 0.55, 0.02
+
+
+def build_scene_cloud(depth_m, rgb, K, person_mask=None, stride=None,
+                      person_stride=None, centre=None, half=None):
+    """Room cloud with the selected person's surface emphasised.
+
+    Shared by both engines so the two demos look identical.  Without a mask this
+    is the plain single-rate cloud; with one, the person is sampled at
+    `person_stride` and left bright while everything else is dimmed, so rotating
+    the view shows the mesh against exactly the points it has to explain.
+    """
+    stride = DISPLAY_STRIDE if stride is None else stride
+    person_stride = PERSON_CLOUD_STRIDE if person_stride is None else person_stride
+    h, w = depth_m.shape
+    parts = []
+    if person_mask is None or person_stride >= stride:
+        rates = ((stride, None),)
+    else:
+        rates = ((person_stride, True), (stride, False))
+    for st, want_person in rates:
+        ys, xs = np.mgrid[0:h:st, 0:w:st].reshape(2, -1)
+        z = depth_m[ys, xs]
+        keep = (z > MINZ) & (z < MAXZ)
+        if want_person is not None:
+            on = person_mask[ys, xs]
+            keep &= on if want_person else ~on
+        if not keep.any():
+            continue
+        xs_k, ys_k, z_k = xs[keep], ys[keep], z[keep]
+        x = (xs_k - K[0, 2]) * z_k / K[0, 0]
+        y = (ys_k - K[1, 2]) * z_k / K[1, 1]
+        pts = np.stack([x, y, z_k], axis=1).astype(np.float32)
+        col = rgb[ys_k, xs_k].astype(np.float32) / 255.0
+        if want_person is True:
+            col = col * PERSON_CLOUD_GAIN + PERSON_CLOUD_LIFT
+        elif want_person is False:
+            col = col * ROOM_CLOUD_GAIN + ROOM_CLOUD_LIFT
+        else:
+            col = col * CLOUD_GAIN + CLOUD_LIFT
+        parts.append((pts, np.clip(col, 0.0, 1.0)))
+    if not parts:
+        return o3d.geometry.PointCloud(), np.zeros((0, 3), np.float32)
+    cloud = np.concatenate([p[0] for p in parts])
+    col = np.concatenate([p[1] for p in parts])
+    if centre is not None and half is not None and len(cloud):
+        keep = np.all(np.abs(cloud - centre) < half, axis=1)
+        cloud, col = cloud[keep], col[keep]
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(
+        np.ascontiguousarray(cloud * FLIP, np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(np.ascontiguousarray(col, np.float64))
+    return pcd, cloud
+
+
 def build_cloud_geometry(cloud, col):
     # Vector3dVector copies float64 straight into its buffer but converts anything
     # else element-by-element (~35x slower); cloud/col are float32, so cast first.
@@ -667,12 +1039,12 @@ def build_mesh_geometry(o3d_faces, verts_m, joints_m, sig_s, vis_idx, head_infov
     return mesh, ls, joints
 
 
-def build_facing_arrow(joints_m):
-    """Build an orange arrow from the pelvis in the SMPL body's forward direction.
+def body_forward(joints_m):
+    """Unit forward axis of the body in the camera frame, or None.
 
-    SMPL indices are pelvis=0, left/right hip=1/2, neck=12 and left/right
-    shoulder=16/17.  Combining hips and shoulders makes the estimate less
-    sensitive to an articulated or partly occluded arm.
+    SMPL indices: pelvis=0, left/right hip=1/2, neck=12, left/right shoulder=16/17.
+    Combining hips and shoulders keeps this stable when one arm is articulated or
+    partly occluded.
     """
     J = np.asarray(joints_m, dtype=np.float64)
     if J.shape[0] < 18 or not np.isfinite(J[:18]).all():
@@ -683,12 +1055,34 @@ def build_facing_arrow(joints_m):
     rn, un = np.linalg.norm(right), np.linalg.norm(up)
     if rn < 1e-5 or un < 1e-5:
         return None
-    right /= rn; up /= un
-    forward = np.cross(up, right)
+    forward = np.cross(up / un, right / rn)
     fn = np.linalg.norm(forward)
-    if fn < 1e-5:
+    return forward / fn if fn > 1e-5 else None
+
+
+def root_offset_for(forward):
+    """Torso half-thickness along the camera axis, from the body's facing.
+
+    |cos| of the angle between the forward axis and the camera's +z: 1 when the
+    person faces the camera (or away), 0 in profile.
+    """
+    if not ORIENT_ROOT_OFFSET or forward is None:
+        return ROOT_OFFSET
+    frontal = abs(float(forward[2]))          # camera looks along +z
+    return ROOT_OFFSET_PROFILE + (ROOT_OFFSET - ROOT_OFFSET_PROFILE) * frontal
+
+
+def build_facing_arrow(joints_m):
+    """Build an orange arrow from the pelvis in the SMPL body's forward direction.
+
+    SMPL indices are pelvis=0, left/right hip=1/2, neck=12 and left/right
+    shoulder=16/17.  Combining hips and shoulders makes the estimate less
+    sensitive to an articulated or partly occluded arm.
+    """
+    J = np.asarray(joints_m, dtype=np.float64)
+    forward = body_forward(joints_m)
+    if forward is None:
         return None
-    forward /= fn
 
     # create_arrow points along local +Z.  Transform only for display after the
     # direction was estimated in the camera frame.
@@ -730,7 +1124,14 @@ def main():
     yolo = YOLO(YOLO_MODEL)
     person_cls = next((i for i, n in yolo.names.items()
                        if str(n).lower() == "person"), 0)
+    direct_yolo = None
+    if YOLO_DIRECT and str(YOLO_MODEL).endswith(".engine"):
+        from yolo_trt_runtime import YoloSegTRT
+        direct_yolo = YoloSegTRT(YOLO_MODEL, conf=0.4, person_class=person_cls)
+        print("YOLO: direct TensorRT runner (ultralytics wrapper bypassed)",
+              flush=True)
     ema = MeshEMA(a=0.6)
+    root_stab = RootStabiliser(MAX_ROOT_SPEED, ROOT_JUMP_GRACE)
     head_hold = HeadHold()
     o3d_faces = o3d.utility.Vector3iVector(faces)
 
@@ -759,6 +1160,7 @@ def main():
           "rgb_msg": None, "depth_msg": None, "proc_ms": 0.0, "cloud_hz": 0.0,
           "cam_set": False, "running": True, "rgb_recv_t": None,
           "rgb_sensor_lag": None, "last_infer_recv_t": None,
+          "seg_view": None, "seg_cb": False, "fit_mask": None,
           "mesh_profile": None, "profile_rows": [], "mesh_update_pending": False,
           "last_vis_idx": None}
     HALF = 1.2
@@ -811,18 +1213,21 @@ def main():
         if fr is None:
             return
         rgb, depth_m, K = fr[:3]
-        cloud, col = backproject(depth_m, rgb, K, stride=DISPLAY_STRIDE)
         centre = st["pelvis"]
         if centre is None:
-            centre = np.median(cloud, 0) if len(cloud) else np.zeros(3)
-        if len(cloud):
-            keep = np.all(np.abs(cloud - centre) < HALF, axis=1)
-            cloud, col = cloud[keep], col[keep]
-        st["cloud_geo"] = build_cloud_geometry(cloud, col)   # built here, off the GUI thread
+            probe, _ = backproject(depth_m, rgb, K, stride=DISPLAY_STRIDE * 3)
+            centre = np.median(probe, 0) if len(probe) else np.zeros(3)
+        # The mask of whoever is being fitted, so their surface is emphasised.
+        pcd, cloud = build_scene_cloud(depth_m, rgb, K,
+                                       person_mask=st.get("fit_mask"),
+                                       centre=centre, half=HALF)
+        st["cloud_geo"] = pcd                                # built off the GUI thread
         if COMPARE_RUN is not None:
-            compare_cloud = cloud.copy()
-            compare_cloud[:, 0] += COMPARE_OFFSET_X
-            st["compare_cloud_geo"] = build_cloud_geometry(compare_cloud, col)
+            # Same points, shifted sideways so the comparison model has its own
+            # cloud to sit in.  Colours come straight off the built geometry.
+            shifted = o3d.geometry.PointCloud(pcd)
+            shifted.translate((COMPARE_OFFSET_X * FLIP[0], 0.0, 0.0))
+            st["compare_cloud_geo"] = shifted
         else:
             st["compare_cloud_geo"] = None
 
@@ -845,20 +1250,38 @@ def main():
         p = {"_recv_t": recv_t, "topic_wait": (t0-recv_t)*1e3,
              "decode_copy": decode_ms, "sensor_lag": sensor_lag}
         q = time.perf_counter()
-        # Tracking is pure overhead here: `largest_person` ranks by box area and
-        # nothing downstream reads a track id.
-        res = yolo.predict(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
-                           classes=[person_cls], conf=0.4, verbose=False)[0]
-        p["yolo"] = (time.perf_counter()-q)*1e3
-        sp = getattr(res, "speed", None) or {}
-        p["yolo_pre"] = sp.get("preprocess")
-        p["yolo_gpu"] = sp.get("inference")
-        p["yolo_post"] = sp.get("postprocess")
+        people = None
+        if direct_yolo is not None and SEG_PICK:
+            # Decode every person so the panel can show them all and the user
+            # can click one; costs one extra mask decode per extra person.
+            people = direct_yolo(rgb, all_people=True)
+            chosen = pick_person(people)
+            det = (people[chosen][0], people[chosen][1]) if chosen is not None else None
+            PICK_STATE["people"] = people
+            p["yolo"] = (time.perf_counter()-q)*1e3
+            p["detection_post"] = 0.0
+        elif direct_yolo is not None:
+            # Straight to TensorRT: takes RGB as-is (no full-frame colour
+            # conversion) and returns the same (box, mask) largest_person does.
+            det = direct_yolo(rgb)
+            p["yolo"] = (time.perf_counter()-q)*1e3
+            p["detection_post"] = 0.0
+        else:
+            # Tracking is pure overhead here: `largest_person` ranks by box area
+            # and nothing downstream reads a track id.
+            res = yolo.predict(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                               classes=[person_cls], conf=0.4, verbose=False)[0]
+            p["yolo"] = (time.perf_counter()-q)*1e3
+            sp = getattr(res, "speed", None) or {}
+            p["yolo_pre"] = sp.get("preprocess")
+            p["yolo_gpu"] = sp.get("inference")
+            p["yolo_post"] = sp.get("postprocess")
         q = time.perf_counter()
         verts_m = joints_m = sig_s = vis_idx = None; mask = None; head_infov = True
         compare_result = None
-        det = largest_person(res, rgb.shape[:2])
-        p["detection_post"] = (time.perf_counter()-q)*1e3
+        if direct_yolo is None:
+            det = largest_person(res, rgb.shape[:2])
+            p["detection_post"] = (time.perf_counter()-q)*1e3
         if det is not None:
             box, mask = det
             q = time.perf_counter()
@@ -872,7 +1295,16 @@ def main():
                 compare_result = COMPARE_RUN(rgb, box, device)
                 p["compare_model"] = (time.perf_counter()-cq)*1e3
             q = time.perf_counter()
-            root_m = metric_root(pelvis_px, depth_m, K, mask)
+            # The regressor's joints are root-relative here, but a direction is
+            # translation-invariant, so the facing axis is already valid.
+            fwd = body_forward(j29)
+            root_m = metric_root(pelvis_px, depth_m, K, mask,
+                                 root_offset=root_offset_for(fwd))
+            root_m = blend_root(root_m, MODEL_CAM_T, K)
+            if MAX_ROOT_SPEED > 0:
+                root_m = root_stab(root_m)
+            p["root_offset"] = (root_offset_for(fwd) if fwd is not None
+                                else ROOT_OFFSET)
             p["metric_root"] = (time.perf_counter()-q)*1e3
             if root_m is not None:
                 q = time.perf_counter()
@@ -917,7 +1349,11 @@ def main():
                 p["visible_surface"] = (time.perf_counter()-q)*1e3
                 st["pelvis"] = joints_m[0].copy()        # crop centre for the fast cloud
         else:
-            ema.reset(); st["sig"] = None; st["pelvis"] = None
+            ema.reset(); root_stab.reset()
+            st["sig"] = None; st["pelvis"] = None
+            # A new person means a new build: drop any smoothed shape estimate.
+            if callable(globals().get("reset_shape_state")):
+                reset_shape_state()
             st["last_vis_idx"] = None
             UPPER_REFINE_STATE["valid"] = False
         # The comparison geometry gets the same metric grounding and depth-only
@@ -973,6 +1409,11 @@ def main():
         p["geometry"] = p["geometry_build"]
         p["frame_total"] = p["worker_total"]
         p["end_to_end"] = p["topic_to_geometry"]
+        st["fit_mask"] = mask if det is not None else None
+        if SEG_VIEW:
+            st["seg_view"] = (build_seg_view_multi(rgb, people, chosen, p.get("yolo"))
+                              if people is not None
+                              else build_seg_view(rgb, det, p.get("yolo")))
         st["mesh_profile"] = p
         st["proc_ms"] = p["worker_total"]
         if st["count"] % 30 == 0:
@@ -1007,10 +1448,26 @@ def main():
     m_joint.base_color = [1, 1, 1, 1]                          # white -> per-sphere vertex colours show
     m_arrow = rendering.MaterialRecord(); m_arrow.shader = "defaultLit"
     m_arrow.base_color = [1, 1, 1, 1]
+    def pump_seg_view():
+        """Show the segmentation panel from the GUI thread.
+
+        Driven off the cloud update rather than the mesh one: the mesh callback
+        only fires when a fit produced geometry, so with nobody in frame the
+        panel would freeze on the last person instead of showing NO PERSON.
+        """
+        if SEG_VIEW and st["seg_view"] is not None:
+            title = "segmentation (input to the fit)"
+            cv2.imshow(title, st["seg_view"])
+            if SEG_PICK and not st.get("seg_cb"):
+                cv2.setMouseCallback(title, _on_seg_click)
+                st["seg_cb"] = True
+            cv2.waitKey(1)
+
     def update_cloud():
         """THIN main-thread swap: geometry was already built in cloud_worker, so this
         only removes the old cloud and adds the new one (a GPU upload, no CPU build).
         Touches only the "cloud" geometry -> never blocks on the mesh; runs ~30 Hz."""
+        pump_seg_view()
         pcd = st["cloud_geo"]
         if pcd is None:
             return
@@ -1093,6 +1550,15 @@ def main():
     threading.Thread(target=cloud_worker, daemon=True).start()
     print(f"live {DISPLAY_MODEL_NAME} 3D running (cloud@~{CLOUD_HZ}Hz / mesh@~10Hz); "
           "close the window to stop", flush=True)
+    if RUN_SECONDS > 0:
+        # Close the window on a timer so a latency run is reproducible without
+        # hand timing; the shutdown path (and its PROFILE table) is unchanged.
+        def _autostop():
+            time.sleep(RUN_SECONDS)
+            if st["running"]:
+                print(f"--run-seconds {RUN_SECONDS:.0f} elapsed; closing", flush=True)
+                gui.Application.instance.post_to_main_thread(win, win.close)
+        threading.Thread(target=_autostop, daemon=True).start()
     gui.Application.instance.run()               # blocks until the window is closed
     st["running"] = False                        # stop workers posting to a dead window
     time.sleep(1.5 / CLOUD_HZ)                    # let in-flight worker iterations drain

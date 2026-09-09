@@ -15,3 +15,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+
+# Benchmark scratch: the scripts are tracked, the models/engines they download
+# and build are hundreds of MB and machine-specific
+occlusion_recovery/yolo_bench/*.pt
+occlusion_recovery/yolo_bench/*.onnx
+occlusion_recovery/yolo_bench/*.engine
+occlusion_recovery/yolo_bench/*.png

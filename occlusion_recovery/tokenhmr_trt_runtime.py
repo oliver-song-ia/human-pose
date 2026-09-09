@@ -20,13 +20,17 @@ class TokenHMRTensorRT:
             raise RuntimeError(f"failed to deserialize TensorRT engine: {path}")
         self.context = self.engine.create_execution_context()
         self.outputs = {}
-        dtype_map = {
-            trt.float32: torch.float32,
-            trt.float16: torch.float16,
-            trt.int32: torch.int32,
-            trt.int64: torch.int64,
-            trt.bool: torch.bool,
-        }
+        # TensorRT 8.x predates several of these members (int64 among them), so
+        # build the map from what this build actually exposes.
+        dtype_map = {}
+        for name, torch_dtype in (("float32", torch.float32),
+                                  ("float16", torch.float16),
+                                  ("int32", torch.int32),
+                                  ("int64", torch.int64),
+                                  ("int8", torch.int8),
+                                  ("bool", torch.bool)):
+            if hasattr(trt, name):
+                dtype_map[getattr(trt, name)] = torch_dtype
         for name in self.OUTPUTS:
             shape = tuple(self.engine.get_tensor_shape(name))
             dtype = dtype_map[self.engine.get_tensor_dtype(name)]
