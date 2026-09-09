@@ -22,7 +22,7 @@ from pathlib import Path
 import torch
 
 HERE = Path(__file__).resolve().parent
-TOKENHMR_ROOT = HERE.parent / "third_party" / "TokenHMR"
+TOKENHMR_ROOT = HERE / "third_party" / "TokenHMR"
 CHECKPOINT = "data/checkpoints/tokenhmr_model_latest.ckpt"   # relative to TOKENHMR_ROOT
 MODEL_CONFIG = "data/checkpoints/model_config.yaml"
 

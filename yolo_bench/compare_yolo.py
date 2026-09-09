@@ -1,7 +1,7 @@
 """下载官方 YOLO26 n/s/m-seg,导出 TensorRT FP16,用相机真实帧对比速度。"""
 import os, sys, time, json
 import numpy as np, cv2
-sys.path.insert(0, "/media/oliver/9a72b131-ff4a-4fc1-a6d5-53ef9c8524e1/code/human-pose/occlusion_recovery")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 MODELS = ["yolo26n-seg", "yolo26s-seg", "yolo26m-seg"]
@@ -41,7 +41,7 @@ def bench(engine_path, label):
 
 results = []
 for name in MODELS:
-    eng = f"/media/oliver/9a72b131-ff4a-4fc1-a6d5-53ef9c8524e1/code/human-pose/occlusion_recovery/yolo_bench/{name}.engine"
+    eng = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.engine")
     if not os.path.exists(eng):
         print(f"[{name}] 下载 + 导出 TensorRT ...", flush=True)
         t = time.time()

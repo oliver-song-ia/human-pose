@@ -25,7 +25,6 @@
 运行示例：
 
 ```bash
-cd occlusion_recovery
 DISPLAY=:0 ~/anaconda3/envs/human-pose/bin/python mesh_live_o3d.py --engine hmr2
 DISPLAY=:0 ~/anaconda3/envs/human-pose/bin/python mesh_live_o3d.py --engine hybrik
 DISPLAY=:0 ~/anaconda3/envs/human-pose/bin/python compare_pose_overlay_tmp.py
@@ -180,7 +179,7 @@ HMR2 的 ViT backbone 与 SMPL transformer head 导出为固定
 `1x3x256x256` FP16 TensorRT engine：
 
 ```text
-occlusion_recovery/engines/hmr2_vit_head_256_fp16.engine
+engines/hmr2_vit_head_256_fp16.engine
 ```
 
 运行时采用 TensorRT 10 tensor API，并让输入输出直接绑定 PyTorch CUDA

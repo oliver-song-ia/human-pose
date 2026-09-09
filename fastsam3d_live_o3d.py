@@ -26,9 +26,11 @@ import zmq
 import live_pipeline as PIPE
 import mesh_live_o3d as ML
 
+# Fast SAM 3D Body ships as a submodule (see .gitmodules); FAST_SAM_3D_ROOT
+# points elsewhere for a checkout kept outside the tree.
 FAST_ROOT = Path(os.environ.get(
     "FAST_SAM_3D_ROOT",
-    "/media/oliver/9a72b131-ff4a-4fc1-a6d5-53ef9c8524e1/code/Fast-SAM-3D-Body"))
+    str(Path(__file__).resolve().parent / "third_party" / "Fast-SAM-3D-Body")))
 WORKER = FAST_ROOT / "ros_realtime/mesh_worker.py"
 sys.path.insert(0, str(FAST_ROOT))  # shared length-prefixed ZMQ wire helper
 YOLO_ENGINE = Path(os.environ.get(

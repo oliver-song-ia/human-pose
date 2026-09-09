@@ -8,7 +8,7 @@ import numpy as np, cv2
 ap = argparse.ArgumentParser()
 ap.add_argument("--engine", required=True)
 ap.add_argument("--frames", type=int, default=200)
-ap.add_argument("--repo", default="/home/ia/human-pose/occlusion_recovery")
+ap.add_argument("--repo", default="/home/ia/human-pose")
 a = ap.parse_args()
 sys.path.insert(0, a.repo)
 

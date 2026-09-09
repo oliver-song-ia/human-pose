@@ -91,8 +91,7 @@ def smooth_betas(betas):
     return st["mean"]
 
 HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE.parent
-TOKENHMR_ROOT = PROJECT_ROOT / "third_party" / "TokenHMR"
+TOKENHMR_ROOT = HERE / "third_party" / "TokenHMR"
 # Escape hatch for benchmarking the PyTorch path on a machine that has an engine.
 TOKENHMR_ALLOW_TRT = os.environ.get("TOKENHMR_NO_TRT", "0") != "1"
 

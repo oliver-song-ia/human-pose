@@ -1,15 +1,15 @@
 # TensorRT engines and exported ONNX weights: GB-scale and machine/GPU-specific,
-# rebuilt locally with occlusion_recovery/export_tokenhmr_trt.py
-occlusion_recovery/engines/
+# rebuilt locally with export_tokenhmr_trt.py
+engines/
 
 # Downloaded model assets
-occlusion_recovery/models/
+models/
 
 # Run logs and profiling output
-occlusion_recovery/outputs/
+outputs/
 
 # TokenHMR is an unmodified upstream clone plus multi-GB checkpoints; fetch it
-# with the command in occlusion_recovery/README.md rather than tracking it.
+# with the command in PIPELINE.md rather than tracking it.
 # Fast-SAM-3D-Body is a submodule (see .gitmodules) because it carries our own
 # worker and Jetson fixes.
 third_party/TokenHMR/
@@ -21,7 +21,7 @@ __pycache__/
 
 # Benchmark scratch: the scripts are tracked, the models/engines they download
 # and build are hundreds of MB and machine-specific
-occlusion_recovery/yolo_bench/*.pt
-occlusion_recovery/yolo_bench/*.onnx
-occlusion_recovery/yolo_bench/*.engine
-occlusion_recovery/yolo_bench/*.png
+yolo_bench/*.pt
+yolo_bench/*.onnx
+yolo_bench/*.engine
+yolo_bench/*.png
