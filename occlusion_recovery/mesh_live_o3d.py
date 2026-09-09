@@ -19,10 +19,24 @@ Engines:
 
     DISPLAY=:0 ~/anaconda3/envs/human-pose/bin/python mesh_live_o3d.py --engine tokenhmr
 """
-import os, sys, types, argparse, time
+# PyTorch sizes its intra-op thread pool to the core count (12 here), but this
+# pipeline runs its model on the GPU: those threads only serve small CPU ops
+# like the SMPL skinning, where 12-way parallelism costs more in synchronisation
+# than it saves.  Worse, they saturate the CPU and starve the depth fit running
+# in the same process -- measured on an Orin, `fit` went 41.2 -> 8.3 ms and the
+# mesh rate 8.9 -> 14.9 Hz purely from capping this, with the GPU inference
+# itself unchanged (33.3 vs 33.1 ms).  Set before torch is imported.
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+
+import sys, types, argparse, time
 from pathlib import Path
 import numpy as np
 import torch
+
+# Belt and braces: OMP_NUM_THREADS only takes effect if it is set before the
+# OpenMP runtime initialises, which a different entry point might not honour.
+torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "4")))
 
 import live_pipeline as PIPE    # full pipeline: viz, ROS, threading, SMPL maths
 
@@ -267,6 +281,9 @@ def main():
     ap.add_argument("--seg-pick", action="store_true",
                     help="show every detected person in the segmentation window "
                          "and fit the one you click (implies --seg-view)")
+    ap.add_argument("--person-cloud-stride", type=int, default=None,
+                    help="sampling stride for the emphasised person surface; "
+                         "finer than the room costs upload bandwidth")
     ap.add_argument("--display-stride", type=int, default=None,
                     help="display point-cloud pixel stride (default 6; higher is sparser)")
     args, _ = ap.parse_known_args()
@@ -304,6 +321,8 @@ def main():
         PIPE.CLOUD_HZ = args.cloud_hz
     if args.display_stride is not None:
         PIPE.DISPLAY_STRIDE = args.display_stride
+    if args.person_cloud_stride is not None:
+        PIPE.PERSON_CLOUD_STRIDE = args.person_cloud_stride
     if args.engine == "tokenhmr":
         PIPE.DISPLAY_MODEL_NAME = "TokenHMR"
         PIPE.load_model = load_tokenhmr_engine    # rebind the two model hooks main() calls

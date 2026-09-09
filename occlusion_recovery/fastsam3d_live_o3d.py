@@ -279,6 +279,13 @@ def main():
     ap.add_argument("--no-yolo-window", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--with-tokenhmr", action="store_true",
                     help="overlay TokenHMR (orange) with Fast SAM 3D (green)")
+    ap.add_argument("--render-hz", type=float, default=20.0,
+                    help="scene update rate; the renderer's steady GPU load "
+                         "competes with the worker's bursty inference")
+    ap.add_argument("--no-gui", action="store_true",
+                    help="run the pipeline without the Open3D window; the "
+                         "renderer holds the GPU continuously, which starves "
+                         "the worker's bursty submissions")
     ap.add_argument("--seg-hz", type=float, default=8.0,
                     help="detection rate for the picker panel; lower leaves more "
                          "GPU for the mesh model")
@@ -729,6 +736,31 @@ def main():
     inference_thread = threading.Thread(target=inference_loop, daemon=True)
     cloud_thread.start(); inference_thread.start()
 
+    if args.no_gui:
+        # Diagnostic / headless: everything runs except the viewer.  Filament
+        # renders continuously at vsync, and on a Jetson that steady GPU load
+        # competes with the worker, which submits one burst per inference.
+        print("running without the Open3D window", flush=True)
+        end = time.monotonic() + (args.run_seconds or 1e9)
+        try:
+            while state["running"] and time.monotonic() < end:
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            pass
+        state["running"] = False
+        cloud_thread.join(timeout=1.0)
+        inference_thread.join(timeout=2.5)
+        if state["profile_rows"]:
+            PIPE.unified_summary(state["profile_rows"], "Fast SAM 3D")
+        if worker is not None:
+            worker.terminate()
+            try: worker.wait(timeout=5)
+            except subprocess.TimeoutExpired: worker.kill()
+        frames.close(linger=0); results.close(linger=0)
+        node.destroy_node(); rclpy.try_shutdown()
+        if log is not None: log.close()
+        return
+
     # The legacy Visualizer ignores mesh alpha.  Use the same GUI renderer and
     # transparency material as the TokenHMR live demo so the two engines have
     # directly comparable presentation.
@@ -822,11 +854,28 @@ def main():
             gui_state["update_pending"] = False
 
     def render_loop():
+        """Post scene updates at --render-hz, and only when there is new content.
+
+        This used to post every 10 ms regardless.  Nothing produces geometry
+        that fast -- the mesh arrives a few times a second and the cloud at
+        cloud_hz -- so most of those posts re-uploaded unchanged geometry, and
+        the resulting steady GPU load starved the Fast SAM worker, whose own
+        submissions come in one burst per inference: measured on an Orin, the
+        worker's inference read 264 ms with the viewer running and 157 ms
+        without it.
+        """
+        period = 1.0 / max(args.render_hz, 1.0)
         while state["running"]:
-            if not gui_state["update_pending"]:
+            started = time.monotonic()
+            if not gui_state["update_pending"] and (
+                    state["cloud"] is not None or state["mesh"] is not None
+                    or state["token_mesh"] is not None
+                    or state["skeleton"] is not None
+                    or not state["person_detected"]
+                    or (args.yolo_window and state["yolo_viz"] is not None)):
                 gui_state["update_pending"] = True
                 app.post_to_main_thread(win, update_scene)
-            time.sleep(0.01)
+            time.sleep(max(0.005, period - (time.monotonic() - started)))
 
     render_thread = threading.Thread(target=render_loop, daemon=True)
     render_thread.start()
