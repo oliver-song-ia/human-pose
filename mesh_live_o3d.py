@@ -120,6 +120,38 @@ def _install_smpl_tables(smpl):
 
 
 # --- TokenHMR engine ---------------------------------------------------------
+def load_smpl_tables(device):
+    """SMPL topology alone: no regressor, no engine, no checkpoint.
+
+    A process that receives a finished fit over ROS still needs the mesh faces
+    and the joint tables to ground it, refine it and draw it -- and cannot load
+    the engine anyway, since 1.3 GB of it is already resident in the process
+    that did the fitting.  This is the same SMPL layer load_tokenhmr_engine
+    performs, without the regressor beside it.
+    """
+    sys.path.insert(0, str(TOKENHMR_ROOT))
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(TOKENHMR_ROOT)
+        os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+        from tokenhmr.lib.configs import get_config
+        from tokenhmr.lib.models.smpl_wrapper import SMPL
+
+        cfg = get_config("data/checkpoints/model_config.yaml")
+        cfg.defrost()
+        if cfg.MODEL.BACKBONE.TYPE == "vit" and "BBOX_SHAPE" not in cfg.MODEL:
+            cfg.MODEL.BBOX_SHAPE = [192, 256]
+        cfg.freeze()
+        smpl_cfg = {k.lower(): v for k, v in dict(cfg.SMPL).items()}
+        smpl = SMPL(**smpl_cfg).to(device).eval()
+    finally:
+        os.chdir(old_cwd)
+    faces = _install_smpl_tables(smpl)
+    print(f"loaded SMPL tables only (no regressor); mesh faces {faces.shape}",
+          flush=True)
+    return faces
+
+
 def load_tokenhmr_engine(device):
     sys.path.insert(0, str(TOKENHMR_ROOT))
     # Import the local runner before temporarily chdir'ing into TokenHMR;

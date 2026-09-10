@@ -75,6 +75,14 @@ UP_IN_FRAME = {"world": np.array([0.0, 0.0, 1.0]),
 CAM_QUEUE = 45
 
 
+# The wire layout of --fit-topic, written by wave_detector.py and documented
+# there: the tail is four points of camera parameters, preceded by the SMPL-24
+# joints (w = per-joint sigma), preceded by the mesh vertices.  Reading from
+# the end keeps a different mesh size parseable.
+FIT_JOINTS = 24
+FIT_TAIL = 4
+
+
 def stamp_ns(header):
     return int(header.stamp.sec) * 1_000_000_000 + int(header.stamp.nanosec)
 
@@ -189,6 +197,13 @@ def main():
                          "no TF; 'world' needs semantic_perception running to "
                          "broadcast it, and falls back to the camera frame")
     ap.add_argument("--world-frame", default="semantic_world")
+    ap.add_argument("--fit-topic", default="/wave_detector/body_fit",
+                    help="the upstream node's TokenHMR fit, consumed instead "
+                         "of running the regressor a second time")
+    ap.add_argument("--own-fit", action="store_true",
+                    help="load the regressor and fit here. Only for running "
+                         "this node without wave_detector: the engine is "
+                         "1.3 GB and two processes cannot both hold it.")
     ap.add_argument("--run-seconds", type=float, default=0.0)
     ap.add_argument("--verbose", action="store_true")
     PIPE.add_camera_args(ap)
@@ -206,7 +221,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "1")))
-    eng, tf_model, faces = ML.load_tokenhmr_engine(device)
+    if args.own_fit:
+        eng, tf_model, faces = ML.load_tokenhmr_engine(device)
+    else:
+        # The fit arrives from upstream; only the SMPL topology is needed here
+        # to ground, refine and draw it.
+        eng = tf_model = None
+        faces = ML.load_smpl_tables(device)
 
     rclpy.init()
     node = rclpy.create_node("pose_from_tracker")
@@ -233,7 +254,35 @@ def main():
         st["cam_frame"] = m.header.frame_id or st["cam_frame"]
         rgb_buf.push(m)
 
+    # Fits keyed by the stamp of the frame they were fitted to, so one is
+    # matched to its own colour, depth and mask rather than to the newest.
+    fit_by_stamp = {}
+
+    def on_fit(m):
+        from sensor_msgs.msg import PointCloud2   # noqa: F401  (type is fixed)
+        a = np.frombuffer(m.data, np.float32).reshape(-1, 4)
+        if len(a) < FIT_JOINTS + FIT_TAIL + 1:
+            return
+        verts = a[:-(FIT_JOINTS + FIT_TAIL), :3].copy()
+        joints = a[-(FIT_JOINTS + FIT_TAIL):-FIT_TAIL, :3].copy()
+        sigma = a[-(FIT_JOINTS + FIT_TAIL):-FIT_TAIL, 3].copy()
+        tail = a[-FIT_TAIL:]
+        cam_t = None
+        if tail[3, 2] > 0.5:
+            cam_t = {"cam_t": tail[1, :3].copy(),
+                     "box_center": tail[2, :2].copy(),
+                     "box_size": float(tail[2, 2]),
+                     "crop_px": float(tail[3, 0]),
+                     "crop_focal": float(tail[3, 1])}
+        fit_by_stamp[stamp_ns(m.header)] = (verts, joints,
+                                           tail[0, :2].copy(), sigma, cam_t)
+        while len(fit_by_stamp) > 16:
+            del fit_by_stamp[next(iter(fit_by_stamp))]
+
     node.create_subscription(Image, args.tracked_mask, on_mask, qos)
+    if not args.own_fit:
+        from sensor_msgs.msg import PointCloud2
+        node.create_subscription(PointCloud2, args.fit_topic, on_fit, qos)
     PIPE.subscribe_camera(
         node, cam_qos, on_rgb, depth_buf.push,
         lambda m: st.update(K=np.array(m.k, np.float32).reshape(3, 3)))
@@ -349,8 +398,18 @@ def main():
             mask = (mask > 0).astype(np.uint8)
 
             # ---- the fit -------------------------------------------------
-            verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
-                eng, tf_model, rgb, box, device)
+            if args.own_fit:
+                verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
+                    eng, tf_model, rgb, box, device)
+            else:
+                got = fit_by_stamp.pop(key, None)
+                if got is None:
+                    # The upstream fit for this exact frame has not arrived, or
+                    # never will because that frame was skipped there.
+                    skips += 1
+                    time.sleep(period / 4)
+                    continue
+                verts, joints, pelvis_px, sigma, PIPE.MODEL_CAM_T = got
             forward = PIPE.body_forward(joints)
             root = PIPE.metric_root(pelvis_px, depth_m, K, mask,
                                     PIPE.root_offset_for(forward))
