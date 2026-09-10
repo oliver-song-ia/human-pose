@@ -14,12 +14,14 @@ surface refine -> Open3D):
 
 ## Getting the dependencies
 
-Fast SAM 3D Body is a submodule -- it carries our own ZMQ mesh worker and the
-fixes needed to run on a Jetson, so it is not the upstream tree:
+Fast SAM 3D Body lives in `third_party/Fast-SAM-3D-Body`, tracked here in full
+rather than fetched: it is not the upstream tree, because it carries our own ZMQ
+mesh worker and the fixes needed to run on a Jetson.  A plain clone gets it:
 
-    git clone --recurse-submodules git@github.com:oliver-song-ia/human-pose.git
-    # or, in an existing clone:
-    git submodule update --init --recursive
+    git clone git@github.com:oliver-song-ia/human-pose.git
+
+(Its multi-GB checkpoints stay out via that directory's own `.gitignore`; fetch
+them from the upstream project.)
 
 TokenHMR is unmodified upstream and is not tracked, because its checkpoints run
 to several GB:

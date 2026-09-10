@@ -1,3 +1,0 @@
-[submodule "fast-sam-3d-body"]
-	path = third_party/Fast-SAM-3D-Body
-	url = git@github.com:oliver-song-ia/Fast-SAM-3D-Body.git

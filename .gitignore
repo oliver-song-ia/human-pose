@@ -1,18 +1,23 @@
+# Anchored to the repository root on purpose.  Unanchored, "models/" matches a
+# directory of that name at ANY depth -- which silently excluded all of
+# third_party/Fast-SAM-3D-Body/sam_3d_body/models/, the Jetson TensorRT fixes
+# included, when that tree stopped being a submodule.
+
 # TensorRT engines and exported ONNX weights: GB-scale and machine/GPU-specific,
 # rebuilt locally with export_tokenhmr_trt.py
-engines/
+/engines/
 
 # Downloaded model assets
-models/
+/models/
 
 # Run logs and profiling output
-outputs/
+/outputs/
 
 # TokenHMR is an unmodified upstream clone plus multi-GB checkpoints; fetch it
-# with the command in PIPELINE.md rather than tracking it.
-# Fast-SAM-3D-Body is a submodule (see .gitmodules) because it carries our own
-# worker and Jetson fixes.
-third_party/TokenHMR/
+# with the command in PIPELINE.md rather than tracking it.  Fast-SAM-3D-Body is
+# tracked here in full: it carries our own ZMQ worker and Jetson fixes, and its
+# own .gitignore (kept) keeps its multi-GB checkpoints out.
+/third_party/TokenHMR/
 
 __pycache__/
 *.py[cod]
