@@ -1,0 +1,20 @@
+[Unit]
+Description=Pin Jetson CPU/GPU/EMC clocks to maximum
+# jetson_clocks reads the active nvpmodel profile and pins every clock to that
+# profile's ceiling.  Without it the schedutil governor never ramps up under
+# this workload -- the GPU waits between short CPU bursts look like idle time --
+# and the CPU sits at ~70% of its maximum, which directly slows the launch-bound
+# parts of the mesh pipeline (measured: frame_total 344 -> 286 ms).
+After=nvpmodel.service
+Wants=nvpmodel.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# nvpmodel needs a moment to apply its profile before the clocks are pinned to it
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/jetson_clocks
+ExecStop=/usr/bin/jetson_clocks --restore
+
+[Install]
+WantedBy=multi-user.target
