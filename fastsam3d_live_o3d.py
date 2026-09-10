@@ -421,7 +421,7 @@ def main():
                     seg_people = seg_yolo(rgb, all_people=True)
                     # Resolve the click here so the selection reacts at panel
                     # rate; the inference loop reads the resulting target.
-                    seg_chosen = PIPE.pick_person(seg_people)
+                    seg_chosen = PIPE.pick_person(seg_people, rgb)
                     state["yolo_viz"] = PIPE.build_seg_view_multi(
                         rgb, seg_people, seg_chosen,
                         (time.perf_counter() - t_seg) * 1000)

@@ -245,15 +245,24 @@ RUN_SECONDS = 0.0        # >0: close the window automatically after N seconds
 SEG_VIEW = False
 SEG_VIEW_WIDTH = 480
 # Click a person in the segmentation window to fit that one instead of whichever
-# happens to be largest.  Selection persists across frames by tracking the box
-# centre, so it survives the target being briefly overtaken or occluded.
+# happens to be largest.  The choice is then held by a PersonTrack (below), not
+# re-decided each frame.
 SEG_PICK = False
-PICK_STATE = {"target": None,    # (cx, cy) of the chosen person, source pixels
+PICK_STATE = {"track": None,     # PersonTrack for the chosen person, or None
+              "status": None,    # "locked" / "coasting", for the panel banner
               "click": None,     # pending click from the GUI thread
               "people": None,    # candidates of the last frame, for hit-testing
               "scale": 1.0}
-PICK_MAX_DRIFT = 0.35            # max centre move between frames, as a fraction
-                                 # of the box diagonal, before the lock is lost
+# Association gates.  The source here runs anywhere from 3 to 30 Hz, so these
+# are expressed per box-diagonal and per second rather than per frame -- a
+# threshold in pixels-per-frame that works at 30 Hz drops every lock at 3 Hz.
+PICK_COAST_S = 2.0        # hold a lock this long with no accepted match
+PICK_POS_GATE = 0.8       # residual from the PREDICTED centre, in box diagonals
+PICK_SCALE_TOL = 0.55     # |log| box-size ratio a real person can show
+PICK_APPEAR_W = 1.5       # colour weight when several candidates pass the gates
+PICK_REACQ_CORREL = 0.45  # colour agreement required to re-acquire after a miss
+PICK_APPEAR_LEARN = 0.1   # how fast the colour model follows lighting and pose
+PICK_MAX_EXTRAP = 2.0     # cap the coasting prediction at this many diagonals
 
 # Body-facing indicator.  SMPL's labelled left/right torso joints remove the
 # 180-degree ambiguity that a plain person bounding box has: anatomical forward
@@ -927,22 +936,159 @@ def unified_summary(rows, model_name, warmup=5):
     print(f"  -> mesh rate {1000/np.median(a):.1f} Hz from frame_total", flush=True)
 
 
-def pick_person(people):
-    """Choose which candidate to fit: the clicked one, else the largest.
+def _appearance(rgb, box, mask):
+    """Hue-saturation histogram over the person's mask pixels, L1-normalised.
 
-    `people` is [(box, mask, conf), ...] largest first.  A pending click selects
-    whichever box contains it; after that the choice follows the nearest box
-    centre from frame to frame, so the lock survives the person being overtaken
-    in size or briefly lost.
+    Cropped to the box first: the masks are full-frame, so indexing one whole
+    would copy the entire image for every candidate on every frame.  Hue and
+    saturation only -- value is what changes when the person walks into shade.
     """
-    if not people:
+    if rgb is None or mask is None:
         return None
-    boxes = np.array([p[0] for p in people], np.float64)
-    centres = np.stack([(boxes[:, 0] + boxes[:, 2]) * 0.5,
-                        (boxes[:, 1] + boxes[:, 3]) * 0.5], axis=1)
+    h, w = rgb.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in box)
+    x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(int(x2), w), min(int(y2), h)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    m = np.ascontiguousarray(mask[y1:y2, x1:x2]).astype(np.uint8)
+    if int(m.sum()) < 64:
+        return None
+    hsv = cv2.cvtColor(np.ascontiguousarray(rgb[y1:y2, x1:x2]), cv2.COLOR_RGB2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], m, [16, 8], [0, 180, 0, 256])
+    total = float(hist.sum())
+    return hist / total if total > 0 else None
+
+
+def _correl(a, b):
+    """Histogram agreement in [0, 1]; None when either side has no colour."""
+    if a is None or b is None:
+        return None
+    return max(0.0, float(cv2.compareHist(a, b, cv2.HISTCMP_CORREL)))
+
+
+class PersonTrack:
+    """The clicked person, carried across frames.
+
+    Nearest-centre association is not enough: between two frames at 3 Hz a
+    walking person moves further than the gap to a bystander standing still, so
+    nearest-centre hands the lock to the bystander.  A match here has to agree
+    with a PREDICTED position, with the box size, and with the colour the person
+    was wearing, and the position gate is measured in box diagonals so it means
+    the same thing at 3 Hz and at 30 Hz.
+
+    A frame with no acceptable match does NOT release the lock.  The track
+    coasts on its last velocity for PICK_COAST_S and pick_person returns None,
+    so the pipeline fits nobody for those frames rather than silently
+    transferring the fit to a stranger -- a wrong fit looks like a working one,
+    a missing fit does not.
+    """
+
+    def __init__(self, centre, size, hist, t):
+        self.c = np.asarray(centre, np.float64)
+        self.v = np.zeros(2)                  # px/s, so a variable frame rate
+        self.size = np.asarray(size, np.float64)   # cannot corrupt it
+        self.hist = hist
+        self.t = t
+        self.missing_since = None
+
+    @property
+    def diag(self):
+        return max(float(np.hypot(*self.size)), 1.0)
+
+    def coast_s(self, t):
+        return 0.0 if self.missing_since is None else max(0.0, t - self.missing_since)
+
+    def predict(self, t):
+        """Where the person should be now, capped so a long coast cannot fling
+        the prediction off the far side of the image."""
+        step = self.v * max(0.0, t - self.t)
+        far = float(np.linalg.norm(step))
+        limit = PICK_MAX_EXTRAP * self.diag
+        if far > limit:
+            step *= limit / far
+        return self.c + step
+
+    def match(self, boxes, centres, hist_of, t):
+        """(index, correl) of the candidate that is this person, or (None, None).
+
+        `hist_of(i)` is evaluated lazily -- typically only one candidate clears
+        the position and size gates, so only that one costs a histogram.
+        """
+        pred = self.predict(t)
+        # The prediction decays as it ages; widen the gate with it rather than
+        # dropping a lock that only a long gap made uncertain.
+        gate = PICK_POS_GATE * (1.0 + self.coast_s(t) / PICK_COAST_S)
+        dn = np.linalg.norm(centres - pred, axis=1) / self.diag
+        cand_diag = np.hypot(boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1])
+        sn = np.abs(np.log(np.maximum(cand_diag, 1.0) / self.diag))
+        ok = np.flatnonzero((dn <= gate) & (sn <= PICK_SCALE_TOL))
+        best, best_cost, best_correl = None, None, None
+        for i in ok:
+            i = int(i)
+            correl = _correl(self.hist, hist_of(i))
+            # After a miss the position evidence is stale, so colour has to
+            # carry the re-acquisition; without this a passer-by inherits the
+            # lock exactly when the real target is hardest to see.
+            if self.missing_since is not None and correl is not None \
+                    and correl < PICK_REACQ_CORREL:
+                continue
+            cost = dn[i] / gate
+            if correl is not None:
+                cost += PICK_APPEAR_W * (1.0 - correl)
+            if best_cost is None or cost < best_cost:
+                best, best_cost, best_correl = i, cost, correl
+        return best, best_correl
+
+    def update(self, centre, size, hist, correl, t):
+        centre = np.asarray(centre, np.float64)
+        dt = t - self.t
+        if dt > 1e-3:
+            self.v = 0.5 * self.v + 0.5 * (centre - self.c) / dt
+        self.c = centre
+        self.size = 0.7 * self.size + 0.3 * np.asarray(size, np.float64)
+        # Learn the colour only from a confident match: blending a frame where
+        # something is half-covering the person teaches the model the occluder,
+        # and then the occluder is what gets re-acquired.
+        if hist is not None and (correl is None or correl >= PICK_REACQ_CORREL):
+            self.hist = hist if self.hist is None else \
+                (1.0 - PICK_APPEAR_LEARN) * self.hist + PICK_APPEAR_LEARN * hist
+        self.t = t
+        self.missing_since = None
+
+    def miss(self, t):
+        """Record a frame with no match. False once the coast window is spent."""
+        if self.missing_since is None:
+            self.missing_since = t
+        return (t - self.missing_since) <= PICK_COAST_S
+
+
+def pick_person(people, rgb=None):
+    """Choose which candidate to fit: the tracked one, else the largest.
+
+    `people` is [(box, mask, conf), ...] largest first.  A pending click starts
+    a PersonTrack on whichever box contains it; from then on that track decides.
+    Returns None while the track is coasting, so the caller fits nobody rather
+    than the wrong person.  Without a track the behaviour is the old one: the
+    largest box.
+    """
+    now = time.monotonic()
+
+    boxes = centres = None
+    if people:
+        boxes = np.array([p[0] for p in people], np.float64)
+        centres = np.stack([(boxes[:, 0] + boxes[:, 2]) * 0.5,
+                            (boxes[:, 1] + boxes[:, 3]) * 0.5], axis=1)
+    sizes = None if boxes is None else np.stack(
+        [boxes[:, 2] - boxes[:, 0], boxes[:, 3] - boxes[:, 1]], axis=1)
+
+    cache = {}
+    def hist_of(i):
+        if i not in cache:
+            cache[i] = _appearance(rgb, people[i][0], people[i][1])
+        return cache[i]
 
     click = PICK_STATE.get("click")
-    if click is not None:
+    if click is not None and people:
         PICK_STATE["click"] = None
         cx, cy = click
         inside = ((boxes[:, 0] <= cx) & (cx <= boxes[:, 2]) &
@@ -954,20 +1100,34 @@ def pick_person(people):
             areas = ((boxes[hit, 2] - boxes[hit, 0]) *
                      (boxes[hit, 3] - boxes[hit, 1]))
             i = int(hit[int(areas.argmin())])
-            PICK_STATE["target"] = tuple(centres[i])
+            PICK_STATE["track"] = PersonTrack(centres[i], sizes[i], hist_of(i), now)
+            PICK_STATE["status"] = "locked"
             return i
-        PICK_STATE["target"] = None       # clicked empty space -> release
+        PICK_STATE["track"] = None         # clicked empty space -> release
+        PICK_STATE["status"] = None
 
-    target = PICK_STATE.get("target")
-    if target is None:
-        return 0                          # no pick: largest, the old behaviour
-    d = np.linalg.norm(centres - np.asarray(target, np.float64), axis=1)
-    i = int(d.argmin())
-    diag = float(np.hypot(boxes[i, 2] - boxes[i, 0], boxes[i, 3] - boxes[i, 1]))
-    if diag > 1e-6 and d[i] > PICK_MAX_DRIFT * diag:
-        PICK_STATE["target"] = None       # moved too far to still be the same person
-        return 0
-    PICK_STATE["target"] = tuple(centres[i])
+    track = PICK_STATE.get("track")
+    if track is None:
+        return 0 if people else None       # no pick: largest, the old behaviour
+
+    if not people:
+        if not track.miss(now):
+            PICK_STATE["track"] = None
+            PICK_STATE["status"] = None
+        else:
+            PICK_STATE["status"] = "coasting"
+        return None
+
+    i, correl = track.match(boxes, centres, hist_of, now)
+    if i is None:
+        if not track.miss(now):
+            PICK_STATE["track"] = None
+            PICK_STATE["status"] = None
+        else:
+            PICK_STATE["status"] = "coasting"
+        return None
+    track.update(centres[i], sizes[i], hist_of(i), correl, now)
+    PICK_STATE["status"] = "locked"
     return i
 
 
@@ -981,6 +1141,11 @@ def build_seg_view_multi(rgb, people, chosen, ms=None):
     if not people:
         cv2.putText(out, "NO PERSON", (16, 42), cv2.FONT_HERSHEY_SIMPLEX,
                     0.9, (0, 0, 255), 2, cv2.LINE_AA)
+        track = PICK_STATE.get("track")
+        if track is not None:
+            cv2.putText(out, f"COASTING {track.coast_s(time.monotonic()):.1f}s",
+                        (16, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                        (0, 165, 255), 2, cv2.LINE_AA)
         return out
     for i, (box, mask, conf) in enumerate(people):
         picked = (i == chosen)
@@ -998,13 +1163,33 @@ def build_seg_view_multi(rgb, people, chosen, ms=None):
         cv2.putText(out, tag, (x1 + 3, max(y1 - 5, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (0, 255, 255) if picked else (170, 170, 170), 1, cv2.LINE_AA)
-    locked = PICK_STATE.get("target") is not None
-    bar = f"{len(people)} person(s)   {'LOCKED - click elsewhere to release' if locked else 'click a person to fit them'}"
+    status = PICK_STATE.get("status")
+    track = PICK_STATE.get("track")
+    if status == "coasting" and track is not None:
+        # Draw where the track believes the person is.  Without this a coasting
+        # lock is indistinguishable from a lost one: nothing is highlighted
+        # either way, and the natural reaction is to click again -- which throws
+        # away a track that was about to re-acquire.
+        c = track.predict(time.monotonic()) * scale
+        hw, hh = track.size * scale * 0.5
+        p1 = (int(round(c[0] - hw)), int(round(c[1] - hh)))
+        p2 = (int(round(c[0] + hw)), int(round(c[1] + hh)))
+        cv2.rectangle(out, p1, p2, (0, 165, 255), 2)
+        cv2.putText(out, "COASTING", (p1[0] + 3, max(p1[1] - 5, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1, cv2.LINE_AA)
+    if status == "coasting" and track is not None:
+        msg = f"COASTING {track.coast_s(time.monotonic()):.1f}s / {PICK_COAST_S:.0f}s"
+        colour = (0, 165, 255)
+    elif status == "locked":
+        msg, colour = "LOCKED - click elsewhere to release", (0, 255, 255)
+    else:
+        msg, colour = "click a person to fit them", (220, 220, 220)
+    bar = f"{len(people)} person(s)   {msg}"
     if ms is not None:
         bar += f"   detect {ms:.0f} ms"
     cv2.rectangle(out, (0, 0), (small_w, 24), (0, 0, 0), -1)
     cv2.putText(out, bar, (8, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                (0, 255, 255) if locked else (220, 220, 220), 1, cv2.LINE_AA)
+                colour, 1, cv2.LINE_AA)
     return out
 
 
@@ -1343,7 +1528,7 @@ def main():
             # Decode every person so the panel can show them all and the user
             # can click one; costs one extra mask decode per extra person.
             people = direct_yolo(rgb, all_people=True)
-            chosen = pick_person(people)
+            chosen = pick_person(people, rgb)
             det = (people[chosen][0], people[chosen][1]) if chosen is not None else None
             PICK_STATE["people"] = people
             p["yolo"] = (time.perf_counter()-q)*1e3
