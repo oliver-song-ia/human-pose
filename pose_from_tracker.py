@@ -1,42 +1,52 @@
 #!/usr/bin/env python3
-"""Body pose for the person wave_detector has locked.
+"""Bodies for the people semantic_perception segments.
 
-Division of labour: detection, segmentation and identity belong upstream --
-wave_detector.py picks one person out of the scene and follows them.  This node
-runs no detector and decides nothing about who anyone is; it turns that one
-person's pixels into a body and publishes it.
+Division of labour: detection and segmentation are upstream, identity belongs
+to tracker.py, and choosing who matters belongs to whatever policy is watching
+-- wave_detector, today.  This node fits bodies and does not decide anything
+about them, so it depends on the segmenter alone and keeps running whether or
+not anybody has been designated.
 
-  in   /wave_detector/tracked_human_mask   mono8, full resolution, 0 or 255.
-                                           Both the gate and the mask: no white
-                                           pixels means nobody is locked, and
-                                           then nothing here runs.
-       the camera's colour/depth/info topics, paired to the mask BY STAMP.
+Everyone visible enough to fit gets fitted, and their joints go out together.
+Only the designated track is grounded against depth, refined onto its own
+point cloud and drawn: that half costs more than the fit, and a body nobody
+asked for does not need to stand on the floor.
 
-  out  ~/human_pose    geometry_msgs/PoseStamped  pelvis position, +x = facing
+  in   /tracker/instances      vision_msgs/Detection2DArray -- the gate: class,
+                               score and instance id per detection
+       /tracker/instance_mask  16UC1, pixel = instance id, same stamp
+       /tracker/tracks         instance id to track id, as "<track>:<instance>"
+       /tracker/target         std_msgs/Int32, the track to draw, -1 for none
+       the camera's colour/depth/info topics, paired BY STAMP.
+
+  out  ~/joints        sensor_msgs/PointCloud2, 25 points per body -- the 24
+                       SMPL joints then the crown -- with w carrying the
+                       instance id.  Everyone, every frame.
+       ~/human_pose    geometry_msgs/PoseStamped  pelvis position, +x = facing
        ~/human_mesh    visualization_msgs/Marker  TRIANGLE_LIST, the body
        ~/human_facing  visualization_msgs/Marker  ARROW along the facing axis
        ~/human_joints  visualization_msgs/Marker  LINE_LIST, the SMPL skeleton
 
 Notes on the contract:
 
-  * "Nobody locked" is a blank mask, not a silence.  wave_detector publishes an
-    all-zero mask twice a second while no one is locked, precisely so a
-    consumer can tell "nobody" from "the publisher died".  This node treats
-    both as idle -- a blank mask, or no mask at all for --tracker-timeout.
+  * "Nobody designated" is a -1 on /tracker/target, not a silence, and the
+    markers are deleted rather than left standing.  A consumer can tell
+    "nobody" from "the publisher died"; this node treats an instance array
+    older than --tracker-timeout as the second.
 
   * The mask and the colour frame must be paired by stamp.  The mask indexes
     the frame it was computed from; applying it to whichever colour frame is
     newest shifts it by a frame of motion, worst exactly when the person moves.
 
   * Temporal filtering (shape smoothing, root-jump rejection) is on, and is
-    legitimate here in a way it is not against a per-frame detector: the lock
+    legitimate here in a way it is not against a per-frame detector: the track
     upstream is a real identity, held across the person turning, lowering their
     arm or being briefly occluded.  This node does not create that identity, it
-    just relies on it -- and drops all of it the moment the lock goes away.
+    just relies on it -- and drops all of it the moment the target goes away.
 
-The bounding box comes from the mask's own extent.  wave_detector publishes no
-box, and re-deriving one from the mask is exact rather than approximate: the
-mask is what the box would have been drawn around.
+  * The mask says which pixels, the detection says which box.  Both arrive for
+    the same stamp, so neither has to be re-derived from the other: the box a
+    crop is taken from is the box the segmenter actually detected.
 """
 import os
 # Before torch: the intra-op pool otherwise saturates the CPU that the fit and
@@ -75,12 +85,43 @@ UP_IN_FRAME = {"world": np.array([0.0, 0.0, 1.0]),
 CAM_QUEUE = 45
 
 
-# The wire layout of --fit-topic, written by wave_detector.py and documented
-# there: the tail is four points of camera parameters, preceded by the SMPL-24
-# joints (w = per-joint sigma), preceded by the mesh vertices.  Reading from
-# the end keeps a different mesh size parseable.
-FIT_JOINTS = 24
-FIT_TAIL = 4
+# What a person's mask covers of their own detection box with nothing in front
+# of them, measured over 81 person-frames of this camera.  The occlusion gate
+# reads a fraction of it.
+NOMINAL_FILL = 0.39
+
+# Everyone's bodies go out as one cloud: 24 SMPL joints then the crown, w
+# carrying the instance id they belong to.  The crown is the highest mesh
+# vertex within HEAD_RADIUS_M of the head joint -- it travels with the joints
+# because a gesture policy needs it and does not want the 6890-vertex mesh to
+# get it.  The highest vertex of the whole body would be the raised hand.
+JOINTS_PER_BODY = 24
+CROWN_POINT = 1
+BODY_POINTS = JOINTS_PER_BODY + CROWN_POINT
+HEAD_RADIUS_M = 0.25
+J_HEAD = 15
+
+
+def visible_fraction(mask_px: int, box_area: float) -> float:
+    """How much of a person is showing; 1.0 for somebody in the clear.
+
+    Comparing the mask against its own box is what makes this scale-free.  The
+    box on its own says nothing: it shrinks with the visible part of a person,
+    so a mostly hidden one still fills the box it got.
+    """
+    if box_area <= 0.0:
+        return 0.0
+    return min(1.0, (mask_px / box_area) / NOMINAL_FILL)
+
+
+def crown_of(verts: np.ndarray, joints: np.ndarray) -> np.ndarray:
+    """The top of the head: the highest mesh vertex near the head joint.
+
+    Not the highest vertex of the body, which is a raised hand -- the very
+    thing a gesture policy wants to compare against this.  Y is down.
+    """
+    near = verts[np.linalg.norm(verts - joints[J_HEAD], axis=1) < HEAD_RADIUS_M]
+    return near[near[:, 1].argmin()] if len(near) else joints[J_HEAD]
 
 
 def stamp_ns(header):
@@ -174,17 +215,33 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tracked-mask",
-                    default="/wave_detector/tracked_human_mask",
-                    help="mono8 mask of the one locked person")
+    ap.add_argument("--instances", default="/tracker/instances",
+                    help="the gate: class, score and id per segmented instance")
+    ap.add_argument("--instance-mask", default="/tracker/instance_mask",
+                    help="16UC1, pixel = instance id, from the same frame")
+    ap.add_argument("--tracks", default="/tracker/tracks",
+                    help="instance id to track id, written as '<track>:<instance>'")
+    ap.add_argument("--target", default="/tracker/target",
+                    help="the track id whose body is grounded, refined and "
+                         "drawn; everyone else gets joints only")
+    ap.add_argument("--max-occlusion", type=float, default=0.8,
+                    help="skip the fit for anybody hidden by more than this "
+                         "fraction of what an unoccluded person's mask covers")
     ap.add_argument("--ns", default="/pose",
                     help="namespace the results are published under")
+    ap.add_argument("--max-persons", type=int, default=4,
+                    help="most people fitted per frame; the rest wait for the "
+                         "next one, so a crowd cannot stall the loop")
+    ap.add_argument("--human-class", default="human",
+                    help="the class_id semantic_perception labels people with")
     ap.add_argument("--min-mask-px", type=int, default=600,
-                    help="treat a mask smaller than this as nobody locked")
+                    help="skip anybody whose mask is smaller than this: too "
+                         "few pixels to crop a body out of")
     ap.add_argument("--tracker-timeout", type=float, default=2.0,
-                    help="seconds without any mask before going idle; upstream "
-                         "publishes a blank one twice a second, so silence "
-                         "means the publisher stopped, not that nobody is there")
+                    help="seconds without any detections before going idle; "
+                         "upstream publishes every frame, empty ones included, "
+                         "so silence means the publisher stopped rather than "
+                         "that the room is empty")
     ap.add_argument("--depth-tolerance-ms", type=float, default=60.0,
                     help="how far the depth frame may sit from the mask's stamp")
     ap.add_argument("--max-hz", type=float, default=15.0)
@@ -193,17 +250,10 @@ def main():
                          "faster than this even when fitting faster")
     ap.add_argument("--publish-frame", choices=("camera", "world"),
                     default="camera",
-                    help="'camera' matches wave_detector's own frame and needs "
+                    help="'camera' is the optical frame itself and needs "
                          "no TF; 'world' needs semantic_perception running to "
                          "broadcast it, and falls back to the camera frame")
     ap.add_argument("--world-frame", default="semantic_world")
-    ap.add_argument("--fit-topic", default="/wave_detector/body_fit",
-                    help="the upstream node's TokenHMR fit, consumed instead "
-                         "of running the regressor a second time")
-    ap.add_argument("--own-fit", action="store_true",
-                    help="load the regressor and fit here. Only for running "
-                         "this node without wave_detector: the engine is "
-                         "1.3 GB and two processes cannot both hold it.")
     ap.add_argument("--run-seconds", type=float, default=0.0)
     ap.add_argument("--verbose", action="store_true")
     PIPE.add_camera_args(ap)
@@ -221,13 +271,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "1")))
-    if args.own_fit:
-        eng, tf_model, faces = ML.load_tokenhmr_engine(device)
-    else:
-        # The fit arrives from upstream; only the SMPL topology is needed here
-        # to ground, refine and draw it.
-        eng = tf_model = None
-        faces = ML.load_smpl_tables(device)
+    eng, tf_model, faces = ML.load_tokenhmr_engine(device)
 
     rclpy.init()
     node = rclpy.create_node("pose_from_tracker")
@@ -244,45 +288,48 @@ def main():
     tf2_ros.TransformListener(tf_buffer, node)
 
     rgb_buf, depth_buf = StampBuffer(CAM_QUEUE), StampBuffer(CAM_QUEUE)
-    st = {"K": None, "cam_frame": None, "mask": None, "mask_t": 0.0}
+    st = {"K": None, "cam_frame": None, "instances": None, "instances_t": 0.0,
+          "labels": {}, "tracks": {}, "target": -1}
 
-    def on_mask(m):
-        st["mask"] = m
-        st["mask_t"] = time.monotonic()
+    def on_instances(m):
+        st["instances"] = m
+        st["instances_t"] = time.monotonic()
+
+    def on_labels(m):
+        """The 16UC1 instance mask, kept by stamp beside its detections."""
+        st["labels"][stamp_ns(m.header)] = np.frombuffer(
+            m.data, np.uint16).reshape(m.height, m.width)
+        while len(st["labels"]) > CAM_QUEUE:
+            del st["labels"][next(iter(st["labels"]))]
+
+    def on_tracks(m):
+        """instance id -> track id, for this stamp.
+
+        tracker.py writes Detection2D.id as "<track>:<instance>", so the two
+        numbers travel together and either side can be joined on.
+        """
+        mapping = {}
+        for det in m.detections:
+            parts = str(det.id).split(":")
+            if len(parts) == 2 and parts[1].isdigit():
+                mapping[int(parts[1])] = int(parts[0])
+        st["tracks"][stamp_ns(m.header)] = mapping
+        while len(st["tracks"]) > CAM_QUEUE:
+            del st["tracks"][next(iter(st["tracks"]))]
+
+    def on_target(m):
+        st["target"] = int(m.data)
 
     def on_rgb(m):
         st["cam_frame"] = m.header.frame_id or st["cam_frame"]
         rgb_buf.push(m)
 
-    # Fits keyed by the stamp of the frame they were fitted to, so one is
-    # matched to its own colour, depth and mask rather than to the newest.
-    fit_by_stamp = {}
-
-    def on_fit(m):
-        from sensor_msgs.msg import PointCloud2   # noqa: F401  (type is fixed)
-        a = np.frombuffer(m.data, np.float32).reshape(-1, 4)
-        if len(a) < FIT_JOINTS + FIT_TAIL + 1:
-            return
-        verts = a[:-(FIT_JOINTS + FIT_TAIL), :3].copy()
-        joints = a[-(FIT_JOINTS + FIT_TAIL):-FIT_TAIL, :3].copy()
-        sigma = a[-(FIT_JOINTS + FIT_TAIL):-FIT_TAIL, 3].copy()
-        tail = a[-FIT_TAIL:]
-        cam_t = None
-        if tail[3, 2] > 0.5:
-            cam_t = {"cam_t": tail[1, :3].copy(),
-                     "box_center": tail[2, :2].copy(),
-                     "box_size": float(tail[2, 2]),
-                     "crop_px": float(tail[3, 0]),
-                     "crop_focal": float(tail[3, 1])}
-        fit_by_stamp[stamp_ns(m.header)] = (verts, joints,
-                                           tail[0, :2].copy(), sigma, cam_t)
-        while len(fit_by_stamp) > 16:
-            del fit_by_stamp[next(iter(fit_by_stamp))]
-
-    node.create_subscription(Image, args.tracked_mask, on_mask, qos)
-    if not args.own_fit:
-        from sensor_msgs.msg import PointCloud2
-        node.create_subscription(PointCloud2, args.fit_topic, on_fit, qos)
+    from std_msgs.msg import Int32
+    from vision_msgs.msg import Detection2DArray
+    node.create_subscription(Detection2DArray, args.instances, on_instances, qos)
+    node.create_subscription(Image, args.instance_mask, on_labels, cam_qos)
+    node.create_subscription(Detection2DArray, args.tracks, on_tracks, cam_qos)
+    node.create_subscription(Int32, args.target, on_target, 10)
     PIPE.subscribe_camera(
         node, cam_qos, on_rgb, depth_buf.push,
         lambda m: st.update(K=np.array(m.k, np.float32).reshape(3, 3)))
@@ -292,8 +339,11 @@ def main():
     pub_mesh = node.create_publisher(Marker, f"{ns}/human_mesh", 1)
     pub_facing = node.create_publisher(Marker, f"{ns}/human_facing", 1)
     pub_joints = node.create_publisher(Marker, f"{ns}/human_joints", 1)
-    print(f"pose_from_tracker: gate={args.tracked_mask} -> "
-          f"{ns}/human_{{pose,mesh,facing,joints}}", flush=True)
+    from sensor_msgs.msg import PointCloud2
+    pub_bodies = node.create_publisher(PointCloud2, f"{ns}/joints", qos)
+    print(f"pose_from_tracker: {args.instances} -> {ns}/joints (everyone), "
+          f"{ns}/human_{{pose,mesh,facing,joints}} (the target from "
+          f"{args.target})", flush=True)
 
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
 
@@ -311,6 +361,38 @@ def main():
         m.scale.x, m.scale.y, m.scale.z = scale
         m.color = colour
         return m
+
+    def publish_bodies(bodies, header):
+        """Everyone's raw joints, one cloud, w = the instance id.
+
+        This is the machine-readable output the gesture policy reads; it is
+        published whether or not anybody is designated, because deciding who
+        matters is somebody else's job.
+        """
+        import array
+        from sensor_msgs.msg import PointCloud2, PointField
+        data = np.zeros((len(bodies) * BODY_POINTS, 4), np.float32)
+        for k, (inst_id, joints, crown) in enumerate(bodies):
+            lo = k * BODY_POINTS
+            data[lo:lo + JOINTS_PER_BODY, :3] = joints[:JOINTS_PER_BODY]
+            data[lo + JOINTS_PER_BODY, :3] = crown
+            data[lo:lo + BODY_POINTS, 3] = float(inst_id)
+        msg = PointCloud2()
+        msg.header.stamp = header.stamp
+        msg.header.frame_id = st["cam_frame"] or ""
+        msg.height, msg.width = 1, len(data)
+        msg.is_dense = True
+        msg.is_bigendian = False
+        msg.point_step = 16
+        msg.row_step = 16 * len(data)
+        msg.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="w", offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.data = array.array("B", data.tobytes())
+        pub_bodies.publish(msg)
 
     def to_points(a):
         return [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in a]
@@ -349,23 +431,24 @@ def main():
             if args.run_seconds and loop_t0 - t_start > args.run_seconds:
                 break
 
-            mask_msg, K = st["mask"], st["K"]
-            if (mask_msg is None or K is None
-                    or loop_t0 - st["mask_t"] > args.tracker_timeout):
+            inst_msg, K = st["instances"], st["K"]
+            if (inst_msg is None or K is None
+                    or loop_t0 - st["instances_t"] > args.tracker_timeout):
                 idles += 1
                 go_idle()
                 time.sleep(period)
                 continue
 
-            key = stamp_ns(mask_msg.header)
+            key = stamp_ns(inst_msg.header)
             if key == last_key:
                 time.sleep(period / 4)          # nothing new since the last fit
                 continue
 
-            mask = PIPE.decode(mask_msg)
-            box = mask_box(mask)
-            if box is None or int(mask.astype(bool).sum()) < args.min_mask_px:
-                idles += 1                      # blank mask: nobody is locked
+            labels = st["labels"].get(key)
+            humans = [d for d in inst_msg.detections
+                      if d.results and d.results[0].hypothesis.class_id == args.human_class]
+            if labels is None or not humans:
+                idles += 1
                 go_idle()
                 last_key = key
                 time.sleep(period)
@@ -374,9 +457,9 @@ def main():
             rgb_msg = rgb_buf.exact(key)
             dep_msg = depth_buf.nearest(key, depth_tol_ns)
             if rgb_msg is None or dep_msg is None:
-                # Retry briefly: the frame this mask names may still be in
-                # flight.  Give up on it once it is older than the buffer can
-                # hold, so a mask whose frame was missed cannot spin forever.
+                # Retry briefly: the frame these detections name may still be
+                # in flight.  Give up once it is older than the buffer can
+                # hold, so a frame that was missed cannot spin forever.
                 skips += 1
                 skip_rgb[0] += rgb_msg is None
                 skip_depth[0] += dep_msg is None
@@ -388,28 +471,57 @@ def main():
 
             rgb = np.ascontiguousarray(PIPE.decode(rgb_msg))
             depth_m = PIPE.decode_depth(dep_msg)
-            if not (depth_m.shape[:2] == rgb.shape[:2] == mask.shape[:2]):
+            if not (depth_m.shape[:2] == rgb.shape[:2] == labels.shape[:2]):
                 node.get_logger().warn(
                     f"shape mismatch colour {rgb.shape[:2]} depth "
-                    f"{depth_m.shape[:2]} mask {mask.shape[:2]}; depth must be "
-                    "registered to colour", throttle_duration_sec=10.0)
+                    f"{depth_m.shape[:2]} mask {labels.shape[:2]}; depth must "
+                    "be registered to colour", throttle_duration_sec=10.0)
                 time.sleep(period)
                 continue
-            mask = (mask > 0).astype(np.uint8)
 
-            # ---- the fit -------------------------------------------------
-            if args.own_fit:
+            # Which instance the target track is, this frame.  Identity is the
+            # tracker's business; all this node does is look the answer up.
+            track_of = st["tracks"].get(key, {})
+            target_instance = next(
+                (i for i, t in track_of.items() if t == st["target"]), None)
+
+            # ---- fit everyone ------------------------------------------------
+            # Raw joints are enough for anyone who is not the target: a raised
+            # hand is a comparison inside one body, and grounding a body to the
+            # floor is the expensive half.  Only the target pays for that.
+            bodies, target_fit = [], None
+            for det in humans[:args.max_persons]:
+                inst_id = int(det.id) if str(det.id).isdigit() else 0
+                bb = det.bbox
+                box = np.array([bb.center.position.x - bb.size_x / 2.0,
+                                bb.center.position.y - bb.size_y / 2.0,
+                                bb.center.position.x + bb.size_x / 2.0,
+                                bb.center.position.y + bb.size_y / 2.0], np.float32)
+                m = (labels == inst_id).astype(np.uint8)
+                px = int(m.sum())
+                area = max(float(bb.size_x * bb.size_y), 1.0)
+                if (px < args.min_mask_px
+                        or visible_fraction(px, area) < 1.0 - args.max_occlusion):
+                    continue
                 verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
                     eng, tf_model, rgb, box, device)
-            else:
-                got = fit_by_stamp.pop(key, None)
-                if got is None:
-                    # The upstream fit for this exact frame has not arrived, or
-                    # never will because that frame was skipped there.
-                    skips += 1
-                    time.sleep(period / 4)
-                    continue
-                verts, joints, pelvis_px, sigma, PIPE.MODEL_CAM_T = got
+                j = np.asarray(joints, np.float32)
+                v = np.asarray(verts, np.float32)
+                bodies.append((inst_id, j, crown_of(v, j)))
+                if inst_id == target_instance:
+                    target_fit = (verts, joints, pelvis_px, sigma, m)
+            publish_bodies(bodies, inst_msg.header)
+
+            if target_fit is None:
+                # Nobody designated, or the designated one is not fittable this
+                # frame.  Joints still went out for whoever was.
+                idles += 1
+                go_idle()
+                time.sleep(max(0.0, period - (time.monotonic() - loop_t0)))
+                continue
+            verts, joints, pelvis_px, sigma, mask = target_fit
+            mask_msg = inst_msg
+
             forward = PIPE.body_forward(joints)
             root = PIPE.metric_root(pelvis_px, depth_m, K, mask,
                                     PIPE.root_offset_for(forward))
