@@ -52,6 +52,106 @@ YOLO_MODEL = YOLO_ENGINE if Path(YOLO_ENGINE).exists() else YOLO_PT
 # back to ultralytics (needed for a .pt model, which has no engine to drive).
 YOLO_DIRECT = os.environ.get("HUMAN_POSE_YOLO_DIRECT", "1") == "1"
 
+# --- camera topics -------------------------------------------------------
+# Defaults are the Orbbec Gemini driver's.  A bag, or a RealSense, publishes
+# under other names -- the depth aligned to colour rather than a separate depth
+# frame, and often only a compressed colour stream -- so both demos take
+# --camera-ns / --color-topic / --depth-topic / --info-topic (see
+# add_camera_args).  Depth still has to be registered to colour: the pipeline
+# indexes the depth image with colour pixels and rejects a size mismatch.
+COLOR_TOPIC = os.environ.get("HUMAN_POSE_COLOR_TOPIC", "/camera/color/image_raw")
+DEPTH_TOPIC = os.environ.get("HUMAN_POSE_DEPTH_TOPIC", "/camera/depth/image_raw")
+INFO_TOPIC = os.environ.get("HUMAN_POSE_INFO_TOPIC", "/camera/color/camera_info")
+
+
+def add_camera_args(ap):
+    """Topic overrides, shared by both launchers so they subscribe alike."""
+    ap.add_argument("--camera-ns", default=None, metavar="NS",
+                    help="shorthand for a driver that follows the usual layout: "
+                         "NS/color/image_raw, NS/depth/image_raw, "
+                         "NS/color/camera_info (e.g. --camera-ns /camera3)")
+    ap.add_argument("--color-topic", default=None,
+                    help="sensor_msgs/Image or CompressedImage (auto-detected "
+                         "from a /compressed suffix)")
+    ap.add_argument("--depth-topic", default=None,
+                    help="registered depth, e.g. /camera3/aligned_depth_to_color/image_raw")
+    ap.add_argument("--info-topic", default=None,
+                    help="CameraInfo for the COLOUR frame (depth is indexed by "
+                         "colour pixels, so its own K is the wrong one)")
+
+
+def apply_camera_args(args):
+    """Resolve --camera-ns / --*-topic into the module globals used below."""
+    global COLOR_TOPIC, DEPTH_TOPIC, INFO_TOPIC
+    ns = getattr(args, "camera_ns", None)
+    if ns:
+        ns = "/" + ns.strip("/")
+        COLOR_TOPIC = f"{ns}/color/image_raw"
+        DEPTH_TOPIC = f"{ns}/depth/image_raw"
+        INFO_TOPIC = f"{ns}/color/camera_info"
+    COLOR_TOPIC = getattr(args, "color_topic", None) or COLOR_TOPIC
+    DEPTH_TOPIC = getattr(args, "depth_topic", None) or DEPTH_TOPIC
+    INFO_TOPIC = getattr(args, "info_topic", None) or INFO_TOPIC
+    print(f"topics: colour={COLOR_TOPIC}  depth={DEPTH_TOPIC}  info={INFO_TOPIC}",
+          flush=True)
+
+
+def _msg_type(topic):
+    """CompressedImage for a /compressed topic, plain Image otherwise."""
+    from sensor_msgs.msg import CompressedImage, Image
+    return CompressedImage if topic.rstrip("/").endswith("/compressed") else Image
+
+
+def subscribe_camera(node, qos, on_rgb, on_depth, on_info):
+    from sensor_msgs.msg import CameraInfo
+    node.create_subscription(_msg_type(COLOR_TOPIC), COLOR_TOPIC, on_rgb, qos)
+    node.create_subscription(_msg_type(DEPTH_TOPIC), DEPTH_TOPIC, on_depth, qos)
+    node.create_subscription(CameraInfo, INFO_TOPIC, on_info, qos)
+
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def decode(msg):
+    """sensor_msgs Image or CompressedImage -> RGB uint8, or the raw depth grid.
+
+    Depth keeps its wire dtype here; decode_depth converts the units, so that
+    16UC1 millimetres and 32FC1 metres cannot be confused at the call site.
+    """
+    if hasattr(msg, "format"):                            # CompressedImage
+        buf = np.frombuffer(msg.data, np.uint8)
+        if "compressedDepth" in msg.format:
+            # image_transport prepends a header struct to the PNG; its size
+            # varies by version, so seek the signature rather than assume 12.
+            off = bytes(msg.data).find(PNG_MAGIC)
+            buf = buf[off if off >= 0 else 12:]
+            im = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+            if im is None:
+                raise ValueError(f"cannot decode {msg.format}")
+            return im
+        im = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if im is None:
+            raise ValueError(f"cannot decode {msg.format}")
+        return np.ascontiguousarray(im[..., ::-1])        # cv2 gives BGR
+    rows = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.step)
+    if msg.encoding in ("rgb8", "bgr8"):
+        im = rows[:, :msg.width*3].reshape(msg.height, msg.width, 3)
+        return np.ascontiguousarray(im if msg.encoding == "rgb8" else im[..., ::-1])
+    if msg.encoding in ("mono8", "8UC1"):
+        return rows[:, :msg.width].copy()
+    if msg.encoding in ("16UC1", "mono16"):
+        return rows[:, :msg.width*2].copy().view(np.uint16).reshape(msg.height, msg.width)
+    if msg.encoding == "32FC1":
+        return rows[:, :msg.width*4].copy().view(np.float32).reshape(msg.height, msg.width)
+    raise ValueError(f"unsupported image encoding: {msg.encoding}")
+
+
+def decode_depth(msg):
+    """Depth message -> float32 metres.  Integer depth is millimetres by ROS
+    convention (16UC1); float depth is already metres (32FC1)."""
+    d = decode(msg)
+    return d.astype(np.float32) * (1.0 if d.dtype == np.float32 else 0.001)
+
 FLIP_TEST = False        # 2nd flipped forward pass: +accuracy, ~2x slower. off = live
 TEMPORAL_SMOOTHING = True
 HOLD_BODY_PARTS = True
@@ -1136,17 +1236,7 @@ def main():
     o3d_faces = o3d.utility.Vector3iVector(faces)
 
     import rclpy
-    from sensor_msgs.msg import CameraInfo, Image
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-
-    def decode(msg):
-        rows = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.step)
-        if msg.encoding in ("rgb8", "bgr8"):
-            im = rows[:, :msg.width*3].reshape(msg.height, msg.width, 3)
-            return im if msg.encoding == "rgb8" else im[..., ::-1]
-        if msg.encoding == "16UC1":
-            return rows[:, :msg.width*2].copy().view(np.uint16).reshape(msg.height, msg.width)
-        raise ValueError(msg.encoding)
 
     rclpy.init(); node = rclpy.create_node("mesh_live_o3d")
     # cloud + mesh are produced by SEPARATE threads (see cloud_worker/infer_worker):
@@ -1170,7 +1260,6 @@ def main():
     def on_info(m):
         if st["K"] is None:
             st["K"] = np.array(m.k, np.float32).reshape(3, 3)
-    node.create_subscription(CameraInfo, "/camera/color/camera_info", on_info, qos)
     def on_depth(m):
         st["depth_msg"] = m
     def on_rgb(m):
@@ -1182,8 +1271,7 @@ def main():
         hs = m.header.stamp
         st["rgb_sensor_lag"] = (time.time_ns() * 1e-6
                                 - (hs.sec * 1e3 + hs.nanosec * 1e-6))
-    node.create_subscription(Image, "/camera/depth/image_raw", on_depth, qos)
-    node.create_subscription(Image, "/camera/color/image_raw", on_rgb, qos)
+    subscribe_camera(node, qos, on_rgb, on_depth, on_info)
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
 
     def grab_frames():
@@ -1198,10 +1286,10 @@ def main():
             return None
         t0 = time.perf_counter()
         rgb = np.ascontiguousarray(decode(rgb_msg))
-        depth = decode(depth_msg)
+        depth = decode_depth(depth_msg)
         if depth.shape[:2] != rgb.shape[:2]:
             return None
-        out = rgb, depth.astype(np.float32) * 0.001, K
+        out = rgb, depth, K
         return out + (recv_t, (time.perf_counter()-t0)*1e3, sensor_lag)
 
     def cloud_latest():

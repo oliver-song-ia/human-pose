@@ -292,6 +292,7 @@ def main():
                          "finer than the room costs upload bandwidth")
     ap.add_argument("--display-stride", type=int, default=None,
                     help="display point-cloud pixel stride (default 6; higher is sparser)")
+    PIPE.add_camera_args(ap)
     args, _ = ap.parse_known_args()
     if args.engine == "fastsam3d":
         # Fast SAM 3D uses MHR topology (18,439 vertices), a Python-3.11 worker
@@ -316,6 +317,7 @@ def main():
         print("=== ENGINE: Fast SAM 3D TRT raw realtime (MHR + RGB-D) ===",
               flush=True)
         return fast_live.main()
+    PIPE.apply_camera_args(args)
     if args.run_seconds:
         PIPE.RUN_SECONDS = args.run_seconds
     if args.seg_view or args.seg_pick:

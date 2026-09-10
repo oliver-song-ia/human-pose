@@ -101,14 +101,8 @@ exec {worker_python} {WORKER!s} --external-boxes --no-overlay {quiet} --reliable
                             stderr=subprocess.STDOUT, start_new_session=True), log
 
 
-def decode(msg):
-    rows = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.step)
-    if msg.encoding in ("rgb8", "bgr8"):
-        im = rows[:, :msg.width * 3].reshape(msg.height, msg.width, 3)
-        return np.ascontiguousarray(im if msg.encoding == "rgb8" else im[..., ::-1])
-    if msg.encoding == "16UC1":
-        return rows[:, :msg.width * 2].copy().view(np.uint16).reshape(msg.height, msg.width)
-    raise ValueError(f"unsupported image encoding: {msg.encoding}")
+decode = PIPE.decode                 # shared: Image + CompressedImage
+decode_depth = PIPE.decode_depth     # shared: depth -> metres, unit by encoding
 
 
 def build_mesh(verts, faces, visible, visible_color=MESH_VIS,
@@ -320,7 +314,9 @@ def main():
                     help="worker JPEG ROI padding as a fraction of the person's longest side")
     ap.add_argument("--full-frame-worker-input", action="store_true",
                     help="send the full RGB frame to Fast SAM (compatibility/debug fallback)")
+    PIPE.add_camera_args(ap)
     args = ap.parse_args()
+    PIPE.apply_camera_args(args)
     if args.seg_pick:
         args.yolo_window = True          # the picker needs its window
     if not 0.0 < args.mesh_ema_alpha <= 1.0:
@@ -359,7 +355,6 @@ def main():
         print("YOLO: direct TensorRT runner (ultralytics wrapper bypassed)", flush=True)
 
     import rclpy
-    from sensor_msgs.msg import CameraInfo, Image
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
     rclpy.init(); node = rclpy.create_node("fastsam3d_rgbd_live")
     qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -382,11 +377,10 @@ def main():
         now_ns = time.time_ns()
         state.update(rgb=m, stamp=now_ns,
                      sensor_lag=now_ns * 1e-6 - (hs.sec * 1e3 + hs.nanosec * 1e-6))
-    node.create_subscription(Image, "/camera/color/image_raw", on_rgb, qos)
-    node.create_subscription(Image, "/camera/depth/image_raw",
-                             lambda m: state.update(depth=m), qos)
-    node.create_subscription(CameraInfo, "/camera/color/camera_info",
-                             lambda m: state.update(K=np.array(m.k, np.float32).reshape(3, 3)), qos)
+    PIPE.subscribe_camera(
+        node, qos, on_rgb,
+        lambda m: state.update(depth=m),
+        lambda m: state.update(K=np.array(m.k, np.float32).reshape(3, 3)))
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
 
     def cloud_loop():
@@ -443,7 +437,7 @@ def main():
                     # panel rate so the highlight follows a click immediately.
                     state["person_mask"] = (seg_people[seg_chosen][1]
                                             if seg_chosen is not None else None)
-                depth = decode(dep_msg).astype(np.float32) * 0.001
+                depth = decode_depth(dep_msg)
                 if rgb.shape[:2] == depth.shape:
                     # Same builder as the TokenHMR demo, so both look identical.
                     state["cloud"], _ = PIPE.build_scene_cloud(
@@ -472,7 +466,7 @@ def main():
                 time.sleep(0.005); continue
             last_stamp = stamp
             t_decode0 = time.perf_counter()
-            rgb, depth = decode(rgb_msg), decode(dep_msg).astype(np.float32) * 0.001
+            rgb, depth = decode(rgb_msg), decode_depth(dep_msg)
             decode_ms = (time.perf_counter() - t_decode0) * 1000
             if rgb.shape[:2] != depth.shape: continue
             if time.monotonic() - last_send < 1.0 / args.mesh_hz: continue
