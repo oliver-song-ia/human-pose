@@ -576,6 +576,7 @@ def main():
     last_others_t = [0.0]
     last_drawn = [0.0]
     last_people_t = [0.0]
+    last_target = [None]
     last_logged = [0]
     mesh_pool, bone_pool = PointPool(), PointPool()
 
@@ -985,6 +986,24 @@ def main():
             track_of = st["tracks"].get(key, {})
             target_instance = next(
                 (i for i, t in track_of.items() if t == st["target"]), None)
+
+            # A different person is a different body, and every filter here
+            # assumes one.  The root stabiliser exists to reject a pelvis that
+            # jumps, which is exactly what a switch looks like to it, so it
+            # would drag the new body toward where the old one stood; the
+            # shape estimate would blend the two builds over its warm-up.  The
+            # markers go too: holding the previous person's body for
+            # --idle-hold while the target is somebody else is the wrong body
+            # in the wrong place.
+            if st["target"] != last_target[0]:
+                if last_target[0] is not None:
+                    node.get_logger().info(
+                        f"target #{last_target[0]} -> #{st['target']}: "
+                        "resetting the body filters")
+                last_target[0] = st["target"]
+                clear()
+                root_stab.reset()
+                ML.reset_betas_state()
 
             # ---- the target first, and alone ---------------------------------
             # Whoever is designated is the only body anybody is looking at, so
