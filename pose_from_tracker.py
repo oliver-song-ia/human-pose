@@ -12,6 +12,24 @@ Only the designated track is grounded against depth, refined onto its own
 point cloud and drawn: that half costs more than the fit, and a body nobody
 asked for does not need to stand on the floor.
 
+The loop is ordered by what the output is for, because everything in front of
+a message is latency added to it:
+
+  1. the target, fitted alone -- a second person in frame must not put their
+     own fit in front of the body somebody is acting on
+  2. the target grounded and refined, then ~/human_pose, ~/human_joints and
+     ~/human_facing, which are what downstream reads
+  3. everyone else, for the gesture policy, at --others-hz while there is a
+     target (they are secondary then); every frame when there is not
+  4. ~/joints, everybody's raw joints
+  5. ~/human_mesh last, and only when something is subscribed to it.  It is a
+     picture: 2500 decimated triangles are still 7500 Point objects, and a
+     body drawn for nobody would push the next frame's skeleton back.
+
+Measured on an RTX 4070 with two people in frame, camera stamp to the
+skeleton on the wire, not counting the camera driver's own 30-45 ms:
+54 ms median / 75 p90 headless, 67 / 81 with RViz attached.
+
   in   /tracker/instances      vision_msgs/Detection2DArray -- the gate: class,
                                score and instance id per detection
        /tracker/instance_mask  16UC1, pixel = instance id, same stamp
@@ -19,13 +37,14 @@ asked for does not need to stand on the floor.
        /tracker/target         std_msgs/Int32, the track to draw, -1 for none
        the camera's colour/depth/info topics, paired BY STAMP.
 
-  out  ~/joints        sensor_msgs/PointCloud2, 25 points per body -- the 24
-                       SMPL joints then the crown -- with w carrying the
-                       instance id.  Everyone, every frame.
-       ~/human_pose    geometry_msgs/PoseStamped  pelvis position, +x = facing
-       ~/human_mesh    visualization_msgs/Marker  TRIANGLE_LIST, the body
-       ~/human_facing  visualization_msgs/Marker  ARROW along the facing axis
+  out  ~/human_pose    geometry_msgs/PoseStamped  pelvis position, +x = facing
        ~/human_joints  visualization_msgs/Marker  LINE_LIST, the SMPL skeleton
+       ~/human_facing  visualization_msgs/Marker  ARROW along the facing axis
+       ~/joints        sensor_msgs/PointCloud2, 25 points per body -- the 24
+                       SMPL joints then the crown -- with w carrying the
+                       instance id.  Everyone who was fitted this frame.
+       ~/human_mesh    visualization_msgs/Marker  TRIANGLE_LIST, the body,
+                       published last and only to a live subscriber
 
 Notes on the contract:
 
@@ -122,6 +141,61 @@ def crown_of(verts: np.ndarray, joints: np.ndarray) -> np.ndarray:
     """
     near = verts[np.linalg.norm(verts - joints[J_HEAD], axis=1) < HEAD_RADIUS_M]
     return near[near[:, 1].argmin()] if len(near) else joints[J_HEAD]
+
+
+def decimate_topology(verts: np.ndarray, faces: np.ndarray,
+                      target_faces: int) -> np.ndarray:
+    """A coarser triangulation of the same body, as flat TRIANGLE_LIST indices.
+
+    RViz's TRIANGLE_LIST has no index buffer, so every triangle spells out its
+    three corners and SMPL's 13776 faces become 41328 points -- 100 ms a frame
+    of building Python objects, which was the entire latency budget.  Quadric
+    decimation runs once, on the first body fitted; each simplified vertex is
+    then snapped to the SMPL vertex it sits on, which turns the result into an
+    index map that any later pose can be read through.  Topology is fixed
+    across poses and shapes, so once is enough.
+    """
+    import open3d as o3d
+    from scipy.spatial import cKDTree
+
+    v = np.asarray(verts, np.float64)
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(v),
+        o3d.utility.Vector3iVector(np.asarray(faces, np.int32)))
+    small = mesh.simplify_quadric_decimation(target_number_of_triangles=target_faces)
+    _, idx = cKDTree(v).query(np.asarray(small.vertices))
+    tri = idx.astype(np.int32)[np.asarray(small.triangles, np.int32)]
+    # Two simplified vertices can land on one SMPL vertex.  The triangle
+    # between them has no area and nothing but cost.
+    keep = ((tri[:, 0] != tri[:, 1]) & (tri[:, 1] != tri[:, 2])
+            & (tri[:, 0] != tri[:, 2]))
+    return tri[keep].reshape(-1)
+
+
+class PointPool:
+    """Reusable geometry_msgs/Point objects to fill a Marker with.
+
+    Building a Point costs far more than setting one: 41328 fresh ones is
+    51 ms, the same objects mutated in place is 15 ms.  publish() serializes
+    before it returns, so last frame's buffer is free to overwrite.
+    """
+
+    def __init__(self):
+        from geometry_msgs.msg import Point
+        self._Point = Point
+        self._pts = []
+
+    def fill(self, a: np.ndarray):
+        # One numpy-to-float conversion for the whole array beats three per
+        # point, and is most of the difference on its own.
+        rows = a.tolist()
+        if len(self._pts) < len(rows):
+            self._pts.extend(self._Point()
+                             for _ in range(len(rows) - len(self._pts)))
+        pts = self._pts[:len(rows)]
+        for p, r in zip(pts, rows):
+            p.x, p.y, p.z = r
+        return pts
 
 
 def stamp_ns(header):
@@ -244,10 +318,23 @@ def main():
                          "that the room is empty")
     ap.add_argument("--depth-tolerance-ms", type=float, default=60.0,
                     help="how far the depth frame may sit from the mask's stamp")
-    ap.add_argument("--max-hz", type=float, default=15.0)
+    ap.add_argument("--max-hz", type=float, default=30.0,
+                    help="cap on fits per second; the camera runs at 30")
     ap.add_argument("--mesh-hz", type=float, default=10.0,
-                    help="TRIANGLE_LIST is ~1 MB a message; publish it no "
-                         "faster than this even when fitting faster")
+                    help="cap on how often the mesh marker goes out.  It is a "
+                         "picture, not an input: drawing it every frame makes "
+                         "the loop slower than the camera, and then every "
+                         "skeleton queues behind a mesh")
+    ap.add_argument("--others-hz", type=float, default=10.0,
+                    help="how often the people who are not the target are "
+                         "fitted, while there is a target.  They only feed "
+                         "the gesture policy, which debounces over frames; "
+                         "with nobody designated everyone is fitted every "
+                         "frame instead")
+    ap.add_argument("--mesh-faces", type=int, default=2500,
+                    help="decimate the body to this many triangles before "
+                         "publishing it; 0 keeps SMPL's 13776, which costs "
+                         "41328 Point objects a frame")
     ap.add_argument("--publish-frame", choices=("camera", "world"),
                     default="camera",
                     help="'camera' is the optical frame itself and needs "
@@ -291,9 +378,15 @@ def main():
     st = {"K": None, "cam_frame": None, "instances": None, "instances_t": 0.0,
           "labels": {}, "tracks": {}, "target": -1}
 
+    # The fit loop sleeps between frames, and what it is waiting for is one of
+    # these callbacks.  Polling for them on a timer costs half the poll
+    # interval on every frame, in the middle of the path being measured.
+    arrived = threading.Event()
+
     def on_instances(m):
         st["instances"] = m
         st["instances_t"] = time.monotonic()
+        arrived.set()
 
     def on_labels(m):
         """The 16UC1 instance mask, kept by stamp beside its detections."""
@@ -301,6 +394,7 @@ def main():
             m.data, np.uint16).reshape(m.height, m.width)
         while len(st["labels"]) > CAM_QUEUE:
             del st["labels"][next(iter(st["labels"]))]
+        arrived.set()
 
     def on_tracks(m):
         """instance id -> track id, for this stamp.
@@ -347,11 +441,16 @@ def main():
 
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
 
-    tri = np.asarray(faces, np.int32).reshape(-1)
+    # Filled in from the first body fitted, because decimation needs a body to
+    # look at.  --mesh-faces 0 keeps SMPL's own topology.
+    tri = [np.asarray(faces, np.int32).reshape(-1)] if args.mesh_faces <= 0 else [None]
     bones = np.asarray(PIPE.SMPL_BONES, np.int32).reshape(-1)
     root_stab = PIPE.RootStabiliser(PIPE.MAX_ROOT_SPEED, PIPE.ROOT_JUMP_GRACE)
     shown = [False]
     last_mesh_t = [0.0]
+    last_others_t = [0.0]
+    last_logged = [0]
+    mesh_pool, bone_pool = PointPool(), PointPool()
 
     def marker(mid, mtype, frame_id, stamp, scale, colour):
         m = Marker()
@@ -416,11 +515,180 @@ def main():
         root_stab.reset()
         ML.reset_betas_state()
 
+    def instance_of(det):
+        return int(det.id) if str(det.id).isdigit() else 0
+
+    def fit_one(det, labels, rgb):
+        """TokenHMR for one detection, or None if there is too little of them.
+
+        Returns the instance id, the joints, the mesh, and the extras only the
+        target's grounding needs.
+        """
+        if det is None:
+            return None
+        bb = det.bbox
+        box = np.array([bb.center.position.x - bb.size_x / 2.0,
+                        bb.center.position.y - bb.size_y / 2.0,
+                        bb.center.position.x + bb.size_x / 2.0,
+                        bb.center.position.y + bb.size_y / 2.0], np.float32)
+        mask = (labels == instance_of(det)).astype(np.uint8)
+        px = int(mask.sum())
+        area = max(float(bb.size_x * bb.size_y), 1.0)
+        if (px < args.min_mask_px
+                or visible_fraction(px, area) < 1.0 - args.max_occlusion):
+            return None
+        verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
+            eng, tf_model, rgb, box, device)
+        return (instance_of(det), np.asarray(joints, np.float32),
+                np.asarray(verts, np.float32), verts, joints, pelvis_px,
+                sigma, mask)
+
+    def place_target(got, depth_m, K, stamp, prof):
+        """Stand the target's body on the floor, refine it, and publish it.
+
+        Everything in here is for the one designated person: it costs more
+        than the fit that produced them, and nobody is looking at the rest.
+        The pose and the skeleton go out from here -- they are what downstream
+        reads, so nothing slower is allowed in front of them.  The mesh is
+        handed back instead of published, for the caller to send last.
+        Returns None when depth could not place them, which is a frame lost
+        rather than an error.
+        """
+        _, _, _, verts, joints, pelvis_px, sigma, mask = got
+
+        t_stage = time.monotonic()
+        forward = PIPE.body_forward(joints)
+        root = PIPE.metric_root(pelvis_px, depth_m, K, mask,
+                                PIPE.root_offset_for(forward))
+        if root is not None:
+            root = root_stab(PIPE.blend_root(root, PIPE.MODEL_CAM_T, K))
+        if root is None:
+            prof["ground"] += (time.monotonic() - t_stage) * 1e3
+            return None
+        verts_m, joints_m = PIPE.ground(verts, joints, root)
+        vis_idx = PIPE.visible_vertices(verts_m, K, mask, depth_m)
+        verts_m, joints_m = PIPE.refine_to_cloud(
+            verts_m, joints_m, PIPE.person_cloud(depth_m, mask, K),
+            PIPE.vertex_fit_weights(sigma), visible_idx=vis_idx)
+        forward = PIPE.body_forward(joints_m)
+        prof["ground"] += (time.monotonic() - t_stage) * 1e3
+
+        # ---- output frame ------------------------------------------------
+        out_frame, out_up = st["cam_frame"], UP_IN_FRAME["camera"]
+        if args.publish_frame == "world":
+            try:
+                T = tf_to_matrix(tf_buffer.lookup_transform(
+                    args.world_frame, st["cam_frame"], rclpy.time.Time()))
+                verts_m = transform_points(T, verts_m)
+                joints_m = transform_points(T, joints_m)
+                if forward is not None:
+                    forward = T[:3, :3] @ np.asarray(forward)
+                out_frame, out_up = args.world_frame, UP_IN_FRAME["world"]
+            except Exception as exc:
+                # The camera frame is still correct -- TF relates the two --
+                # so degrade rather than drop the frame.
+                node.get_logger().warn(
+                    f"no TF {st['cam_frame']} -> {args.world_frame} "
+                    f"({exc}); publishing in the camera frame",
+                    throttle_duration_sec=10.0)
+
+        # ---- publish -------------------------------------------------------
+        # Order is priority.  The pelvis pose, the skeleton and the facing
+        # arrow are a few hundred bytes each and are what a consumer acts on;
+        # the mesh is a picture, costs more than all of them together, and is
+        # therefore sent last, by the caller, after everyone else is fitted.
+        pelvis = joints_m[0]
+        ps = PoseStamped()
+        ps.header.frame_id, ps.header.stamp = out_frame, stamp
+        ps.pose.position.x = float(pelvis[0])
+        ps.pose.position.y = float(pelvis[1])
+        ps.pose.position.z = float(pelvis[2])
+        q = facing_quaternion(forward, out_up) if forward is not None else None
+        if q is None:
+            ps.pose.orientation.w = 1.0
+        else:
+            (ps.pose.orientation.x, ps.pose.orientation.y,
+             ps.pose.orientation.z, ps.pose.orientation.w) = (
+                float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+        pub_pose.publish(ps)
+
+        t_stage = time.monotonic()
+        if forward is not None:
+            am = marker(1, Marker.ARROW, out_frame, stamp,
+                        (0.035, 0.07, 0.09),
+                        ColorRGBA(r=1.0, g=0.32, b=0.05, a=1.0))
+            am.points = to_points(
+                [pelvis, pelvis + np.asarray(forward) * PIPE.FACING_ARROW_LENGTH])
+            pub_facing.publish(am)
+
+        jm = marker(2, Marker.LINE_LIST, out_frame, stamp,
+                    (0.018, 0.0, 0.0),
+                    ColorRGBA(r=0.95, g=0.95, b=0.35, a=1.0))
+        jm.points = bone_pool.fill(joints_m[bones])
+        pub_joints.publish(jm)
+        shown[0] = True
+        prof["markers"] += (time.monotonic() - t_stage) * 1e3
+        # The skeleton's own age, which is the number that matters: this is
+        # what downstream consumes, and it is on the wire now.
+        prof["pose_age"].append(
+            (node.get_clock().now().nanoseconds
+             - (int(stamp.sec) * 10 ** 9 + int(stamp.nanosec))) / 1e6)
+        return verts_m, out_frame, stamp
+
+    def publish_mesh(verts_m, out_frame, stamp, loop_t0, prof):
+        """The body as a picture, sent after everything a machine reads.
+
+        A TRIANGLE_LIST spells out every triangle's three corners, so even the
+        decimated body is thousands of Point objects; whatever that costs, it
+        costs after the pose and the skeleton have gone.
+
+        And only when somebody is looking.  The loop is the thing standing
+        between a camera frame and the skeleton downstream reads, and a body
+        drawn for nobody would push the next frame's skeleton back by the time
+        it took to draw.
+        """
+        if pub_mesh.get_subscription_count() == 0:
+            return
+        if loop_t0 - last_mesh_t[0] < 1.0 / max(args.mesh_hz, 0.1):
+            return
+        t_stage = time.monotonic()
+        last_mesh_t[0] = loop_t0
+        if tri[0] is None:
+            tri[0] = decimate_topology(verts_m, faces, args.mesh_faces)
+            node.get_logger().info(
+                f"mesh decimated to {len(tri[0]) // 3} faces "
+                f"({len(tri[0])} points, SMPL has {len(faces)})")
+        mm = marker(0, Marker.TRIANGLE_LIST, out_frame, stamp,
+                    (1.0, 1.0, 1.0),
+                    ColorRGBA(r=0.10, g=0.85, b=0.55, a=0.95))
+        mm.points = mesh_pool.fill(verts_m[tri[0]])
+        pub_mesh.publish(mm)
+        prof["mesh"] += (time.monotonic() - t_stage) * 1e3
+        prof["mesh_age"].append(
+            (node.get_clock().now().nanoseconds
+             - (int(stamp.sec) * 10 ** 9 + int(stamp.nanosec))) / 1e6)
+
+    def wait_for_input(timeout):
+        """Sleep until the next detections or mask land, or timeout."""
+        arrived.wait(timeout)
+        arrived.clear()
+
     period = 1.0 / max(args.max_hz, 0.1)
     depth_tol_ns = int(args.depth_tolerance_ms * 1e6)
     t_start = time.monotonic()
     fits = idles = skips = 0
     skip_rgb, skip_depth = [0], [0]
+    # Where a fitted frame's time goes.  Kept always, not behind --verbose:
+    # the loop is a latency budget and this is the only view of it.
+    PROF_KEYS = ("decode", "fit", "ground", "mesh", "markers", "others",
+                 "joints")
+
+    def new_prof():
+        p = {k: 0.0 for k in PROF_KEYS}
+        p["pose_age"], p["mesh_age"] = [], []
+        return p
+
+    prof = new_prof()
     # A colour frame older than the buffer holds is gone for good.
     buffer_span_ns = int(rgb_buf.q.maxlen / 30.0 * 1e9)
     last_key = None
@@ -436,12 +704,12 @@ def main():
                     or loop_t0 - st["instances_t"] > args.tracker_timeout):
                 idles += 1
                 go_idle()
-                time.sleep(period)
+                wait_for_input(period)
                 continue
 
             key = stamp_ns(inst_msg.header)
             if key == last_key:
-                time.sleep(period / 4)          # nothing new since the last fit
+                wait_for_input(period)          # nothing new since the last fit
                 continue
 
             labels = st["labels"].get(key)
@@ -451,7 +719,7 @@ def main():
                 idles += 1
                 go_idle()
                 last_key = key
-                time.sleep(period)
+                wait_for_input(period)
                 continue
 
             rgb_msg = rgb_buf.exact(key)
@@ -465,10 +733,11 @@ def main():
                 skip_depth[0] += dep_msg is None
                 if (node.get_clock().now().nanoseconds - key) > buffer_span_ns:
                     last_key = key
-                time.sleep(period / 4)
+                wait_for_input(period)
                 continue
             last_key = key
 
+            t_stage = time.monotonic()
             rgb = np.ascontiguousarray(PIPE.decode(rgb_msg))
             depth_m = PIPE.decode_depth(dep_msg)
             if not (depth_m.shape[:2] == rgb.shape[:2] == labels.shape[:2]):
@@ -476,7 +745,7 @@ def main():
                     f"shape mismatch colour {rgb.shape[:2]} depth "
                     f"{depth_m.shape[:2]} mask {labels.shape[:2]}; depth must "
                     "be registered to colour", throttle_duration_sec=10.0)
-                time.sleep(period)
+                wait_for_input(period)
                 continue
 
             # Which instance the target track is, this frame.  Identity is the
@@ -485,128 +754,82 @@ def main():
             target_instance = next(
                 (i for i, t in track_of.items() if t == st["target"]), None)
 
-            # ---- fit everyone ------------------------------------------------
-            # Raw joints are enough for anyone who is not the target: a raised
-            # hand is a comparison inside one body, and grounding a body to the
-            # floor is the expensive half.  Only the target pays for that.
-            bodies, target_fit = [], None
-            for det in humans[:args.max_persons]:
-                inst_id = int(det.id) if str(det.id).isdigit() else 0
-                bb = det.bbox
-                box = np.array([bb.center.position.x - bb.size_x / 2.0,
-                                bb.center.position.y - bb.size_y / 2.0,
-                                bb.center.position.x + bb.size_x / 2.0,
-                                bb.center.position.y + bb.size_y / 2.0], np.float32)
-                m = (labels == inst_id).astype(np.uint8)
-                px = int(m.sum())
-                area = max(float(bb.size_x * bb.size_y), 1.0)
-                if (px < args.min_mask_px
-                        or visible_fraction(px, area) < 1.0 - args.max_occlusion):
-                    continue
-                verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
-                    eng, tf_model, rgb, box, device)
-                j = np.asarray(joints, np.float32)
-                v = np.asarray(verts, np.float32)
-                bodies.append((inst_id, j, crown_of(v, j)))
-                if inst_id == target_instance:
-                    target_fit = (verts, joints, pelvis_px, sigma, m)
-            publish_bodies(bodies, inst_msg.header)
+            # ---- the target first, and alone ---------------------------------
+            # Whoever is designated is the only body anybody is looking at, so
+            # nothing else is fitted before it: a second person in frame used
+            # to put their own 13 ms in front of the mesh on screen.  Everyone
+            # else follows, below, for the gesture policy.
+            prof["decode"] += (time.monotonic() - t_stage) * 1e3
+            crowd = humans[:args.max_persons]
+            target_det = next(
+                (d for d in crowd if instance_of(d) == target_instance), None)
 
-            if target_fit is None:
+            t_stage = time.monotonic()
+            bodies = []
+            got = fit_one(target_det, labels, rgb) if target_det else None
+            prof["fit"] += (time.monotonic() - t_stage) * 1e3
+            placed = None
+            if got is None:
                 # Nobody designated, or the designated one is not fittable this
-                # frame.  Joints still went out for whoever was.
+                # frame.  The others are still worth fitting, below.
                 idles += 1
                 go_idle()
-                time.sleep(max(0.0, period - (time.monotonic() - loop_t0)))
-                continue
-            verts, joints, pelvis_px, sigma, mask = target_fit
-            mask_msg = inst_msg
-
-            forward = PIPE.body_forward(joints)
-            root = PIPE.metric_root(pelvis_px, depth_m, K, mask,
-                                    PIPE.root_offset_for(forward))
-            if root is None:
-                time.sleep(period)
-                continue
-            root = root_stab(PIPE.blend_root(root, PIPE.MODEL_CAM_T, K))
-            if root is None:
-                time.sleep(period)
-                continue
-            verts_m, joints_m = PIPE.ground(verts, joints, root)
-            vis_idx = PIPE.visible_vertices(verts_m, K, mask, depth_m)
-            verts_m, joints_m = PIPE.refine_to_cloud(
-                verts_m, joints_m, PIPE.person_cloud(depth_m, mask, K),
-                PIPE.vertex_fit_weights(sigma), visible_idx=vis_idx)
-            forward = PIPE.body_forward(joints_m)
-
-            # ---- output frame --------------------------------------------
-            out_frame, out_up = st["cam_frame"], UP_IN_FRAME["camera"]
-            if args.publish_frame == "world":
-                try:
-                    T = tf_to_matrix(tf_buffer.lookup_transform(
-                        args.world_frame, st["cam_frame"], rclpy.time.Time()))
-                    verts_m = transform_points(T, verts_m)
-                    joints_m = transform_points(T, joints_m)
-                    if forward is not None:
-                        forward = T[:3, :3] @ np.asarray(forward)
-                    out_frame, out_up = args.world_frame, UP_IN_FRAME["world"]
-                except Exception as exc:
-                    # The camera frame is still correct -- TF relates the two --
-                    # so degrade rather than drop the frame.
-                    node.get_logger().warn(
-                        f"no TF {st['cam_frame']} -> {args.world_frame} "
-                        f"({exc}); publishing in the camera frame",
-                        throttle_duration_sec=10.0)
-
-            # ---- publish --------------------------------------------------
-            stamp = mask_msg.header.stamp
-            pelvis = joints_m[0]
-            ps = PoseStamped()
-            ps.header.frame_id, ps.header.stamp = out_frame, stamp
-            ps.pose.position.x = float(pelvis[0])
-            ps.pose.position.y = float(pelvis[1])
-            ps.pose.position.z = float(pelvis[2])
-            q = facing_quaternion(forward, out_up) if forward is not None else None
-            if q is None:
-                ps.pose.orientation.w = 1.0
             else:
-                (ps.pose.orientation.x, ps.pose.orientation.y,
-                 ps.pose.orientation.z, ps.pose.orientation.w) = (
-                    float(q[0]), float(q[1]), float(q[2]), float(q[3]))
-            pub_pose.publish(ps)
+                bodies.append((got[0], got[1], crown_of(got[2], got[1])))
+                placed = place_target(got, depth_m, K, inst_msg.header.stamp,
+                                      prof)
+                if placed is not None:
+                    fits += 1
 
-            if loop_t0 - last_mesh_t[0] >= 1.0 / max(args.mesh_hz, 0.1):
-                last_mesh_t[0] = loop_t0
-                mm = marker(0, Marker.TRIANGLE_LIST, out_frame, stamp,
-                            (1.0, 1.0, 1.0),
-                            ColorRGBA(r=0.10, g=0.85, b=0.55, a=0.95))
-                mm.points = to_points(verts_m[tri])
-                pub_mesh.publish(mm)
+            # ---- everybody else, for the gesture policy ----------------------
+            # Raw joints are all a raised hand needs -- it is a comparison
+            # inside one body -- and the policy debounces over frames anyway,
+            # so these do not have to keep up with the camera while somebody
+            # is designated.  With nobody designated there is no target
+            # latency to protect and everyone is a candidate, so the rate
+            # limit lifts: otherwise /pose/joints would go empty on the frames
+            # in between, and the policy would be reading a room that keeps
+            # emptying out.
+            t_stage = time.monotonic()
+            if (target_det is None
+                    or loop_t0 - last_others_t[0] >= 1.0 / max(args.others_hz, 0.1)):
+                last_others_t[0] = loop_t0
+                for det in crowd:
+                    if det is target_det:
+                        continue
+                    other = fit_one(det, labels, rgb)
+                    if other is not None:
+                        bodies.append(
+                            (other[0], other[1], crown_of(other[2], other[1])))
+            prof["others"] += (time.monotonic() - t_stage) * 1e3
+            t_stage = time.monotonic()
+            publish_bodies(bodies, inst_msg.header)
+            prof["joints"] += (time.monotonic() - t_stage) * 1e3
 
-            if forward is not None:
-                am = marker(1, Marker.ARROW, out_frame, stamp,
-                            (0.035, 0.07, 0.09),
-                            ColorRGBA(r=1.0, g=0.32, b=0.05, a=1.0))
-                am.points = to_points(
-                    [pelvis,
-                     pelvis + np.asarray(forward) * PIPE.FACING_ARROW_LENGTH])
-                pub_facing.publish(am)
+            # Last, and only now: the picture.  Everything a consumer acts on
+            # has already gone out.
+            if placed is not None:
+                publish_mesh(*placed, loop_t0, prof)
 
-            jm = marker(2, Marker.LINE_LIST, out_frame, stamp,
-                        (0.018, 0.0, 0.0),
-                        ColorRGBA(r=0.95, g=0.95, b=0.35, a=1.0))
-            jm.points = to_points(joints_m[bones])
-            pub_joints.publish(jm)
-            shown[0] = True
-
-            fits += 1
-            if args.verbose and fits % 30 == 0:
+            if fits and fits % 30 == 0 and fits != last_logged[0]:
+                last_logged[0] = fits
                 age = (node.get_clock().now().nanoseconds - key) / 1e6
-                print(f"fits={fits} idle={idles} "
-                      f"skip={skips} (rgb {skip_rgb[0]} / depth {skip_depth[0]}) "
-                      f"{(time.monotonic()-loop_t0)*1e3:.0f} ms/fit  "
-                      f"frame-age {age:.0f} ms", flush=True)
-            time.sleep(max(0.0, period - (time.monotonic() - loop_t0)))
+                stages = "  ".join(f"{k} {prof[k] / 30.0:.1f}" for k in PROF_KEYS)
+                def ages(key, label):
+                    v = prof[key]
+                    return (f"{label} {np.median(v):.0f}/{np.percentile(v, 90):.0f} "
+                            f"(p50/p90) ms  " if v else "")
+                print(f"[PoseProfile] {stages}  |  "
+                      f"{(time.monotonic() - loop_t0) * 1e3:.0f} ms/fit  "
+                      f"{ages('pose_age', 'skeleton-age')}"
+                      f"{ages('mesh_age', 'mesh-age')}frame-age {age:.0f} ms  "
+                      f"fits={fits} idle={idles} skip={skips} "
+                      f"(rgb {skip_rgb[0]} / depth {skip_depth[0]})", flush=True)
+                prof = new_prof()
+            left = period - (time.monotonic() - loop_t0)
+            if left > 0:
+                time.sleep(left)
+            arrived.clear()
     except KeyboardInterrupt:
         pass
     finally:
