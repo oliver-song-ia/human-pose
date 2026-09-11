@@ -43,6 +43,10 @@ skeleton on the wire, not counting the camera driver's own 30-45 ms:
        ~/joints        sensor_msgs/PointCloud2, 25 points per body -- the 24
                        SMPL joints then the crown -- with w carrying the
                        instance id.  Everyone who was fitted this frame.
+       ~/people        visualization_msgs/MarkerArray  everyone: a skeleton
+                       each, and a label saying how much of them is in view.
+                       For looking at, not for acting on -- the bodies in it
+                       are placed by depth at the pelvis and not refined.
        ~/human_mesh    visualization_msgs/Marker  TRIANGLE_LIST, the body,
                        published last and only to a live subscriber
 
@@ -435,6 +439,11 @@ def main():
                     help="keep the last body on screen for this long when the "
                          "target cannot be fitted; below it a dropped frame "
                          "reads as a departure and the body blinks")
+    ap.add_argument("--people-hz", type=float, default=10.0,
+                    help="how often ~/people is redrawn; it is a picture and "
+                         "is skipped entirely when nothing subscribes to it")
+    ap.add_argument("--label-size", type=float, default=0.12,
+                    help="height of the per-person text label, in metres")
     ap.add_argument("--mesh-faces", type=int, default=2500,
                     help="decimate the body to this many triangles before "
                          "publishing it; 0 keeps SMPL's 13776, which costs "
@@ -469,7 +478,7 @@ def main():
     from sensor_msgs.msg import Image
     from geometry_msgs.msg import Point, PoseStamped
     from std_msgs.msg import ColorRGBA
-    from visualization_msgs.msg import Marker
+    from visualization_msgs.msg import Marker, MarkerArray
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "1")))
@@ -548,6 +557,7 @@ def main():
     pub_mesh = node.create_publisher(Marker, f"{ns}/human_mesh", 1)
     pub_facing = node.create_publisher(Marker, f"{ns}/human_facing", 1)
     pub_joints = node.create_publisher(Marker, f"{ns}/human_joints", 1)
+    pub_people = node.create_publisher(MarkerArray, f"{ns}/people", 1)
     from sensor_msgs.msg import PointCloud2
     pub_bodies = node.create_publisher(PointCloud2, f"{ns}/joints", qos)
     print(f"pose_from_tracker: {args.instances} -> {ns}/joints (everyone), "
@@ -565,6 +575,7 @@ def main():
     last_mesh_t = [0.0]
     last_others_t = [0.0]
     last_drawn = [0.0]
+    last_people_t = [0.0]
     last_logged = [0]
     mesh_pool, bone_pool = PointPool(), PointPool()
 
@@ -650,13 +661,17 @@ def main():
         return int(det.id) if str(det.id).isdigit() else 0
 
     def fit_one(det, labels, rgb, depth_m, fy):
-        """TokenHMR for one detection, or None if there is too little of them.
+        """TokenHMR for one detection, and how much of them was in view.
 
-        Returns the instance id, the joints, the mesh, and the extras only the
-        target's grounding needs.
+        Returns (visible, fit).  `visible` is the more limiting of the two
+        gates, which is what a viewer wants to be told -- it is reported for
+        everybody, including the people too hidden to fit, because "12% of
+        them is showing" is the answer to "why is there no body here".  `fit`
+        is None for those, and otherwise the instance id, the joints, the mesh
+        and the extras only the target's grounding needs.
         """
         if det is None:
-            return None
+            return 0.0, None
         bb = det.bbox
         box = np.array([bb.center.position.x - bb.size_x / 2.0,
                         bb.center.position.y - bb.size_y / 2.0,
@@ -665,16 +680,17 @@ def main():
         mask = (labels == instance_of(det)).astype(np.uint8)
         px = int(mask.sum())
         area = max(float(bb.size_x * bb.size_y), 1.0)
-        if (px < args.min_mask_px
-                or visible_fraction(px, area) < 1.0 - args.max_occlusion
-                or visible_height_fraction(mask, depth_m, fy)
-                   < args.min_visible_height):
-            return None
+        fill = visible_fraction(px, area)
+        height = visible_height_fraction(mask, depth_m, fy)
+        visible = min(fill, height)
+        if (px < args.min_mask_px or fill < 1.0 - args.max_occlusion
+                or height < args.min_visible_height):
+            return visible, None
         verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
             eng, tf_model, rgb, box, device)
-        return (instance_of(det), np.asarray(joints, np.float32),
-                np.asarray(verts, np.float32), verts, joints, pelvis_px,
-                sigma, mask)
+        return visible, (instance_of(det), np.asarray(joints, np.float32),
+                         np.asarray(verts, np.float32), verts, joints,
+                         pelvis_px, sigma, mask)
 
     def place_target(got, depth_m, K, stamp, prof):
         """Stand the target's body on the floor, refine it, and publish it.
@@ -781,6 +797,77 @@ def main():
              - (int(stamp.sec) * 10 ** 9 + int(stamp.nanosec))) / 1e6)
         return verts_m, out_frame, stamp
 
+    def publish_people(people, track_of, target_instance, depth_m, K, stamp,
+                       loop_t0, prof):
+        """Everybody in frame: their skeleton, and how much of them is showing.
+
+        The target already gets its own markers, drawn from a body that was
+        grounded against depth and refined onto its own point cloud.  These
+        are the cheap version for everyone else -- the raw fit, translated so
+        the pelvis sits where depth says it is, which costs ~1 ms and puts the
+        skeleton on the person rather than wherever the model guessed.  No
+        refinement: nobody is acting on these, they are here to be looked at.
+
+        The percentage goes out for people who were NOT fitted too.  That is
+        the case worth seeing: a label reading 12% with no skeleton under it
+        says the body is missing because the person is, not because anything
+        broke.
+        """
+        if pub_people.get_subscription_count() == 0 or K is None:
+            return
+        if loop_t0 - last_people_t[0] < 1.0 / max(args.people_hz, 0.1):
+            return
+        t_stage = time.monotonic()
+        last_people_t[0] = loop_t0
+        frame = st["cam_frame"] or args.world_frame
+        arr = MarkerArray()
+        # Everything is redrawn every time, so last frame's people have to go
+        # -- otherwise somebody who left the room keeps a skeleton.
+        clear_all = Marker()
+        clear_all.header.frame_id, clear_all.header.stamp = frame, stamp
+        clear_all.ns, clear_all.action = "people", Marker.DELETEALL
+        arr.markers.append(clear_all)
+
+        for inst, visible, fit in people:
+            track = track_of.get(inst)
+            is_target = target_instance is not None and inst == target_instance
+            # The target's own skeleton is already drawn, in its own colour,
+            # from a better fit; here it only needs its label.
+            colour = (ColorRGBA(r=0.95, g=0.95, b=0.35, a=1.0) if is_target
+                      else ColorRGBA(r=0.35, g=0.75, b=0.95, a=0.9))
+            anchor = None
+            if fit is not None:
+                _, j, v, verts, joints, pelvis_px, sigma, mask = fit
+                forward = PIPE.body_forward(joints)
+                root = PIPE.metric_root(pelvis_px, depth_m, K, mask,
+                                        PIPE.root_offset_for(forward))
+                if root is not None:
+                    verts_m, joints_m = PIPE.ground(verts, joints, root)
+                    anchor = crown_of(verts_m, joints_m)
+                    if not is_target:
+                        sk = marker(inst * 2, Marker.LINE_LIST, frame, stamp,
+                                    (0.012, 0.0, 0.0), colour)
+                        sk.ns = "people"
+                        sk.points = to_points(joints_m[bones])
+                        arr.markers.append(sk)
+            if anchor is None:
+                continue          # no depth for them: nowhere to put a label
+            txt = marker(inst * 2 + 1, Marker.TEXT_VIEW_FACING, frame, stamp,
+                         (0.0, 0.0, args.label_size), colour)
+            txt.ns = "people"
+            name = f"#{track}" if track is not None else f"i{inst}"
+            txt.text = f"{name}  {visible * 100:.0f}%"
+            # Y is down in the optical frame, so up is -y: the label floats
+            # above the head rather than inside it.
+            txt.pose.position.x = float(anchor[0])
+            txt.pose.position.y = float(anchor[1] - args.label_size * 2.0)
+            txt.pose.position.z = float(anchor[2])
+            arr.markers.append(txt)
+
+        if len(arr.markers) > 1:
+            pub_people.publish(arr)
+        prof["people"] += (time.monotonic() - t_stage) * 1e3
+
     def publish_mesh(verts_m, out_frame, stamp, loop_t0, prof):
         """The body as a picture, sent after everything a machine reads.
 
@@ -826,7 +913,7 @@ def main():
     # Where a fitted frame's time goes.  Kept always, not behind --verbose:
     # the loop is a latency budget and this is the only view of it.
     PROF_KEYS = ("decode", "fit", "ground", "mesh", "markers", "others",
-                 "joints", "g_vis", "g_refine")
+                 "joints", "people", "g_vis", "g_refine")
 
     def new_prof():
         p = {k: 0.0 for k in PROF_KEYS}
@@ -912,8 +999,11 @@ def main():
             t_stage = time.monotonic()
             bodies = []
             fy = float(K[1, 1]) if K is not None else 0.0
-            got = (fit_one(target_det, labels, rgb, depth_m, fy)
-                   if target_det else None)
+            people = []                      # (instance, visible, fit or None)
+            vis, got = (fit_one(target_det, labels, rgb, depth_m, fy)
+                        if target_det else (0.0, None))
+            if target_det is not None:
+                people.append((instance_of(target_det), vis, got))
             prof["fit"] += (time.monotonic() - t_stage) * 1e3
             placed = None
             if got is None:
@@ -944,7 +1034,8 @@ def main():
                 for det in crowd:
                     if det is target_det:
                         continue
-                    other = fit_one(det, labels, rgb, depth_m, fy)
+                    vis, other = fit_one(det, labels, rgb, depth_m, fy)
+                    people.append((instance_of(det), vis, other))
                     if other is not None:
                         bodies.append(
                             (other[0], other[1], crown_of(other[2], other[1])))
@@ -953,8 +1044,10 @@ def main():
             publish_bodies(bodies, inst_msg.header)
             prof["joints"] += (time.monotonic() - t_stage) * 1e3
 
-            # Last, and only now: the picture.  Everything a consumer acts on
-            # has already gone out.
+            # Last, and only now: the pictures.  Everything a consumer acts
+            # on has already gone out.
+            publish_people(people, track_of, target_instance, depth_m, K,
+                           inst_msg.header.stamp, loop_t0, prof)
             if placed is not None:
                 publish_mesh(*placed, loop_t0, prof)
 
