@@ -648,10 +648,22 @@ def main():
             prof["ground"] += (time.monotonic() - t_stage) * 1e3
             return None
         verts_m, joints_m = PIPE.ground(verts, joints, root)
+        t_sub = time.monotonic()
+        # Hidden-point removal, and it is the expensive half of grounding.  The
+        # z-buffer alternative in live_pipeline (FAST_VISIBILITY) costs 0.2 ms
+        # against this 5, and is off for a reason worth writing down: at 4-pixel
+        # cells 6890 vertices almost never share one, so it barely rejects
+        # anything -- measured against the true surface normals it returns 44%
+        # back-facing vertices where HPR returns 5%.  Coarser cells trade that
+        # for throwing away the front surface: 8% back-facing costs 31% of the
+        # vertices HPR keeps.  No setting is both.
         vis_idx = PIPE.visible_vertices(verts_m, K, mask, depth_m)
+        prof["g_vis"] += (time.monotonic() - t_sub) * 1e3
+        t_sub = time.monotonic()
         verts_m, joints_m = PIPE.refine_to_cloud(
             verts_m, joints_m, PIPE.person_cloud(depth_m, mask, K),
             PIPE.vertex_fit_weights(sigma), visible_idx=vis_idx)
+        prof["g_refine"] += (time.monotonic() - t_sub) * 1e3
         forward = PIPE.body_forward(joints_m)
         prof["ground"] += (time.monotonic() - t_stage) * 1e3
 
@@ -763,7 +775,7 @@ def main():
     # Where a fitted frame's time goes.  Kept always, not behind --verbose:
     # the loop is a latency budget and this is the only view of it.
     PROF_KEYS = ("decode", "fit", "ground", "mesh", "markers", "others",
-                 "joints")
+                 "joints", "g_vis", "g_refine")
 
     def new_prof():
         p = {k: 0.0 for k in PROF_KEYS}
