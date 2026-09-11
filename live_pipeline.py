@@ -35,15 +35,20 @@ MODEL_CAM_T = None
 import open3d as o3d
 from scipy.spatial import cKDTree
 
-HP = "/media/oliver/9a72b131-ff4a-4fc1-a6d5-53ef9c8524e1/code/human-pose"
+HERE = Path(__file__).resolve().parent
+# The segmentation weights belong to the parent project, which is where this
+# repository normally sits as a submodule; relative to here that is one level
+# up.  A standalone checkout, or a machine that keeps them somewhere else,
+# overrides both with the environment variables.
+#
 # A TensorRT engine is tied to one GPU architecture AND one TensorRT version,
 # so every machine needs its own; HUMAN_POSE_YOLO / _PT point at the local ones.
 YOLO_PT = os.environ.get(
     "HUMAN_POSE_YOLO_PT",
-    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260908.pt")
+    str(HERE.parent / "yolo26m-seg-custom_20260908.pt"))
 YOLO_ENGINE = os.environ.get(
     "HUMAN_POSE_YOLO",
-    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260908_rtx4070.engine")
+    str(HERE.parent / "yolo26m-seg-custom_20260908_rtx4070.engine"))
 YOLO_MODEL = YOLO_ENGINE if Path(YOLO_ENGINE).exists() else YOLO_PT
 # The engine is driven through yolo_trt_runtime rather than ultralytics: the
 # wrapper costs 0.2 ms on an RTX 4070 but 20-30 ms on a Jetson, where the host

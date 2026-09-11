@@ -8,7 +8,8 @@ import numpy as np, cv2
 ap = argparse.ArgumentParser()
 ap.add_argument("--engine", required=True)
 ap.add_argument("--frames", type=int, default=200)
-ap.add_argument("--repo", default="/home/ia/human-pose")
+ap.add_argument("--repo",
+                default=str(Path(__file__).resolve().parent.parent))
 a = ap.parse_args()
 sys.path.insert(0, a.repo)
 
@@ -26,6 +27,7 @@ threading.Thread(target=lambda: rclpy.spin(nd), daemon=True).start()
 from ultralytics import YOLO
 import live_pipeline as PIPE
 from yolo_trt_runtime import YoloSegTRT
+from pathlib import Path
 y = YOLO(a.engine)
 pc = next((i for i, n in y.names.items() if str(n).lower() == "person"), 0)
 runner = YoloSegTRT(a.engine, conf=0.4, person_class=pc)

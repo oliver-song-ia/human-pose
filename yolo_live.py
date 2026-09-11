@@ -12,12 +12,15 @@ from collections import deque
 
 import cv2
 import numpy as np
+from pathlib import Path
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", default=os.environ.get(
-        "HUMAN_POSE_YOLO", "/home/ia/assets/yolo26m-seg-custom_20260908.engine"))
+        "HUMAN_POSE_YOLO",
+        str(Path(__file__).resolve().parent.parent
+            / "yolo26m-seg-custom_20260908_rtx4070.engine")))
     ap.add_argument("--ultralytics", action="store_true",
                     help="use the ultralytics wrapper instead of the direct runner")
     ap.add_argument("--conf", type=float, default=0.4)

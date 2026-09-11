@@ -5,7 +5,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 MODELS = ["yolo26n-seg", "yolo26s-seg", "yolo26m-seg"]
-CUSTOM = "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903_rtx4070.engine"
+CUSTOM = str(Path(__file__).resolve().parent.parent.parent
+              / "yolo26m-seg-custom_20260908_rtx4070.engine")
 
 # ---- 固定测试帧:两台机器用同一张图,保证可比 ----
 FRAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_frame.png")
@@ -17,6 +18,7 @@ print(f"测试帧 {bgr.shape[1]}x{bgr.shape[0]}  ({FRAME})", flush=True)
 
 from ultralytics import YOLO
 import live_pipeline as PIPE
+from pathlib import Path
 
 def bench(engine_path, label):
     y = YOLO(engine_path)

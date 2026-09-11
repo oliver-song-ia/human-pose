@@ -4,11 +4,13 @@
 """
 import sys, time, argparse
 import numpy as np, cv2
+from pathlib import Path
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--engine", required=True)
 ap.add_argument("--frame", default=None, help="图片路径;不给就从相机取一帧")
-ap.add_argument("--repo", default="/home/ia/human-pose")
+ap.add_argument("--repo",
+                default=str(Path(__file__).resolve().parent.parent))
 a = ap.parse_args()
 sys.path.insert(0, a.repo)
 

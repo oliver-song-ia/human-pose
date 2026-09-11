@@ -33,12 +33,14 @@ FAST_ROOT = Path(os.environ.get(
     str(Path(__file__).resolve().parent / "third_party" / "Fast-SAM-3D-Body")))
 WORKER = FAST_ROOT / "ros_realtime/mesh_worker.py"
 sys.path.insert(0, str(FAST_ROOT))  # shared length-prefixed ZMQ wire helper
+# One level up is the parent project, which owns the segmentation weights.
+_REPO = Path(__file__).resolve().parent.parent
 YOLO_ENGINE = Path(os.environ.get(
     "HUMAN_POSE_YOLO",
-    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260908_rtx4070.engine"))
+    str(_REPO / "yolo26m-seg-custom_20260908_rtx4070.engine")))
 YOLO_PT = Path(os.environ.get(
     "HUMAN_POSE_YOLO_PT",
-    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260908.pt"))
+    str(_REPO / "yolo26m-seg-custom_20260908.pt")))
 MESH_VIS = np.array([0.10, 0.85, 0.55])
 MESH_HID = np.array([0.20, 0.24, 0.42])
 TOKEN_VIS = np.array([1.00, 0.35, 0.05])
