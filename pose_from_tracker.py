@@ -459,7 +459,7 @@ def main():
     ap.add_argument("--target", default="/tracker/target",
                     help="the track id whose body is grounded, refined and "
                          "drawn; everyone else gets joints only")
-    ap.add_argument("--min-visible-height", type=float, default=0.35,
+    ap.add_argument("--min-visible-height", type=float, default=0.50,
                     help="skip anybody less of whose own length is in view "
                          "than this, measured against how tall a person is at "
                          "the distance depth puts them.  Real people read "
