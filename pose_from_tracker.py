@@ -577,6 +577,13 @@ def main():
     pub_people = node.create_publisher(MarkerArray, f"{ns}/people", 1)
     from sensor_msgs.msg import PointCloud2
     pub_bodies = node.create_publisher(PointCloud2, f"{ns}/joints", qos)
+    # The cloud the registration actually fits to -- eroded, de-spiked and
+    # depth-banded by person_cloud.  Published because the alternative is
+    # judging the mesh by eye against /tracker/target_cloud, which is every
+    # masked pixel the sensor returned including the silhouette band the fit
+    # deliberately throws away: the mesh then looks wrong against points
+    # nothing is trying to match it to.
+    pub_fit_cloud = node.create_publisher(PointCloud2, f"{ns}/fit_cloud", qos)
     print(f"pose_from_tracker: {args.instances} -> {ns}/joints (everyone), "
           f"{ns}/human_{{pose,mesh,facing,joints}} (the target from "
           f"{args.target})", flush=True)
@@ -597,6 +604,13 @@ def main():
     why = Counter()
     prev_root, prev_raw = [None], [None]
     jumps = {"in": deque(maxlen=600), "out": deque(maxlen=600)}
+    # What the depth fit was given and what it did with it.  A registration
+    # that declines to run leaves the mesh wherever the regressor put it, which
+    # is the failure that took longest to find, so it is counted out loud.
+    fit_why, root_why = Counter(), Counter()
+    fit_dz = deque(maxlen=600)
+    fit_match = deque(maxlen=600)
+    root_gap = deque(maxlen=600)
     last_logged = [0]
     mesh_pool, bone_pool = PointPool(), PointPool()
 
@@ -640,6 +654,26 @@ def main():
         ]
         msg.data = array.array("B", data.tobytes())
         pub_bodies.publish(msg)
+
+    def publish_fit_cloud(cloud, frame, stamp):
+        """What refine_to_cloud was given, as XYZ, for a viewer to check."""
+        if pub_fit_cloud.get_subscription_count() == 0 or not len(cloud):
+            return
+        import array
+        from sensor_msgs.msg import PointField
+        pts = np.asarray(cloud, np.float32)
+        msg = PointCloud2()
+        msg.header.frame_id, msg.header.stamp = frame, stamp
+        msg.height, msg.width = 1, len(pts)
+        msg.is_dense, msg.is_bigendian = True, False
+        msg.point_step, msg.row_step = 12, 12 * len(pts)
+        msg.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        msg.data = array.array("B", pts.tobytes())
+        pub_fit_cloud.publish(msg)
 
     def to_points(a):
         return [Point(x=float(p[0]), y=float(p[1]), z=float(p[2])) for p in a]
@@ -760,10 +794,18 @@ def main():
         vis_idx = PIPE.visible_vertices(verts_m, K, mask, depth_m)
         prof["g_vis"] += (time.monotonic() - t_sub) * 1e3
         t_sub = time.monotonic()
+        fit_cloud = PIPE.person_cloud(depth_m, mask, K)
+        publish_fit_cloud(fit_cloud, st["cam_frame"] or args.world_frame, stamp)
         verts_m, joints_m = PIPE.refine_to_cloud(
-            verts_m, joints_m, PIPE.person_cloud(depth_m, mask, K),
+            verts_m, joints_m, fit_cloud,
             PIPE.vertex_fit_weights(sigma), visible_idx=vis_idx)
         prof["g_refine"] += (time.monotonic() - t_sub) * 1e3
+        lr, lroot = PIPE.LAST_REFINE, PIPE.LAST_ROOT
+        fit_why[lr["why"]] += 1
+        fit_dz.append(abs(lr["dz"]))
+        fit_match.append(lr["matched"] / max(lr["cloud"], 1))
+        root_why[lroot["why"]] += 1
+        root_gap.append(abs(lroot["model"] - lroot["depth"]))
         forward = PIPE.body_forward(joints_m)
         prof["ground"] += (time.monotonic() - t_stage) * 1e3
 
@@ -1143,6 +1185,20 @@ def main():
                       + "  ".join(f"{k}={v}" for k, v in why.most_common()),
                       flush=True)
                 why.clear()
+                if len(fit_dz) > 10:
+                    dz = np.asarray(fit_dz) * 100
+                    mt = np.asarray(fit_match) * 100
+                    rg = np.asarray(root_gap) * 100
+                    print(f"[Fit] depth-fit moved the mesh p50 "
+                          f"{np.median(dz):.1f} p90 {np.percentile(dz,90):.0f} "
+                          f"max {dz.max():.0f} cm  on p50 {np.median(mt):.0f}% "
+                          f"of the cloud  |  "
+                          + "  ".join(f"{k}={v}" for k, v in fit_why.most_common())
+                          + f"  |  model-vs-depth range p50 {np.median(rg):.0f} "
+                            f"p90 {np.percentile(rg,90):.0f} cm  "
+                          + "  ".join(f"{k}={v}" for k, v in root_why.most_common()),
+                          flush=True)
+                    fit_why.clear(); root_why.clear()
                 if len(jumps["out"]) > 30:
                     a, b = np.asarray(jumps["in"]), np.asarray(jumps["out"])
                     print(f"[RootJump] depth said p50 {np.median(a)*100:.1f} "

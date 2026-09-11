@@ -171,6 +171,13 @@ EXTERNAL_OCCLUSION = False
 # blend_root).  0.0 = depth only (the old behaviour), 1.0 = trust the model.
 MODEL_ROOT_BLEND = True
 MODEL_ROOT_ALPHA = 0.5
+# How far the model's distance may disagree with the sensor's before the blend
+# stops believing it.  The blend is there to absorb a wrong ROOT_OFFSET, which
+# is a ~10 cm modelling constant, so a disagreement several times that is not
+# about ROOT_OFFSET at all (see blend_root).
+MODEL_ROOT_MAX_DISAGREE = 0.25   # m
+# What the last root decision was made of, for the caller to report.
+LAST_ROOT = {"depth": 0.0, "model": 0.0, "out": 0.0, "why": "never ran"}
 # How far the pelvis sits behind the skin the depth camera actually sees.  This
 # depends on which way the body faces: head-on the sensor sees the chest/belly
 # and the pelvis is ~10 cm behind it, but in profile it sees the side of the
@@ -186,6 +193,23 @@ MAX_ROOT_SPEED = 3.0     # m/s
 ROOT_JUMP_GRACE = 3      # consecutive outlier frames before the jump is accepted
 ICP_MAX_POINTS = 6000    # observed-cloud cap for the depth z-fit (see refine_to_cloud)
 MINZ, MAXZ = 0.3, 5.0
+# What is allowed into the registration cloud (see person_cloud).  A depth
+# sensor does not measure a surface at a depth step, it interpolates across it,
+# so every outline in the image produces a band of points that belong to
+# nothing.  0 disables any of these.
+CLOUD_ERODE_PX = 2          # silhouette band dropped from the mask, in pixels
+CLOUD_SPIKE_M = 0.10        # disagreement with the neighbours' median that is not a surface
+CLOUD_DEPTH_SPAN_M = 0.9    # kept either side of the body's own median depth
+CLOUD_TARGET_POINTS = 2000  # sampling density chosen per frame; 0 keeps the fixed stride
+# How much correspondence the depth fit needs before it will move anything, and
+# how wide it may look on the first pass to find the body again (refine_to_cloud).
+ICP_ACQUIRE_SCALE = 2.0
+ICP_MIN_MATCH_FRAC = 0.10
+ICP_MIN_MATCHES = 60
+# Why the last depth fit did what it did, for the caller to report.  Written by
+# refine_to_cloud; a fit that quietly declines to run is the failure that took
+# longest to find, so it is not allowed to be silent any more.
+LAST_REFINE = {"cloud": 0, "matched": 0, "floor": 0, "dz": 0.0, "why": "never ran"}
 # Cloud vs mesh trade-off (single GPU): the decoupled cloud thread streams point
 # uploads that contend with the model's CUDA + steal the GIL. Higher CLOUD_HZ / finer
 # DISPLAY_STRIDE = smoother cloud but SLOWER mesh inference. 15 Hz / stride 6 keeps
@@ -352,11 +376,31 @@ def blend_root(depth_root, cam_info, K, alpha=None):
     # its depth to the source camera's focal length.
     z_model = float(ct[2]) * (K[0, 0] / src_focal)
     if not (MINZ < z_model < MAXZ):
+        LAST_ROOT.update(depth=float(np.asarray(depth_root)[2]), model=z_model,
+                         out=float(np.asarray(depth_root)[2]),
+                         why="model z out of range")
         return depth_root
     a = MODEL_ROOT_ALPHA if alpha is None else alpha
     out = np.asarray(depth_root, np.float32).copy()
     z_depth = float(out[2])
+    # The blend absorbs a wrong ROOT_OFFSET -- a ~10 cm constant.  When the
+    # model's distance disagrees with the sensor's by much more than that, it
+    # is not correcting ROOT_OFFSET, it is wrong about something else, and
+    # averaging into it does real harm.  Measured live on seated people ~3.2 m
+    # away with the lower body behind a desk: the model's z ran 1.3-1.4 m short
+    # of the sensor's, all day, and at alpha 0.5 that published the mesh 0.68 m
+    # in front of the person -- projecting 309 px tall against their 240, and
+    # far enough out that refine_to_cloud could no longer find it.  Why weak
+    # perspective is biased this way on a half-occluded body is not established
+    # here; that it is, is.  Depth measured the surface it can actually see, so
+    # past this band depth wins, and the remaining ROOT_OFFSET error is what
+    # refine_to_cloud is for.
+    if abs(z_model - z_depth) > MODEL_ROOT_MAX_DISAGREE:
+        LAST_ROOT.update(depth=z_depth, model=z_model, out=z_depth,
+                         why="model too far from depth")
+        return depth_root
     z = (1.0 - a) * z_depth + a * z_model
+    LAST_ROOT.update(depth=z_depth, model=z_model, out=z, why="blended")
     # Keep x, y consistent with the new depth: the pelvis pixel is fixed, so
     # moving along the ray means scaling the lateral offsets too.
     if z_depth > 1e-6:
@@ -550,13 +594,83 @@ def _weighted_median(x, w):
     return float(x[np.searchsorted(c, 0.5 * c[-1])])
 
 
-def person_cloud(depth_m, mask, K, stride=6):
-    """Observed person-surface points (metric camera frame) for the ICP refine."""
-    h, w = depth_m.shape
-    ys, xs = np.mgrid[0:h:stride, 0:w:stride].reshape(2, -1)
+def person_cloud(depth_m, mask, K, stride=6, target_points=None):
+    """Observed person-surface points (metric camera frame) for the ICP refine.
+
+    Only the front surface of one person should reach the registration, so
+    three populations are dropped before they can pull on a median:
+
+      * The silhouette band.  A pixel on the outline straddles the person and
+        whatever is behind them, and the sensor returns neither -- it returns a
+        blend, which lands somewhere in the empty space between the two.  The
+        mask is eroded by CLOUD_ERODE_PX first: that costs the outermost few
+        millimetres of real surface and removes the entire population.
+      * Flying pixels, which are the same failure away from the outline -- the
+        edge of a raised arm against the torso behind it, for instance.  A
+        sample that disagrees with the median of its own neighbours by
+        CLOUD_SPIKE_M is not a surface, it is the sensor interpolating.
+      * Whatever the mask leaked onto.  A silhouette that bleeds onto the wall
+        contributes points a metre behind the body, and a body -- arms and all
+        -- spans well under CLOUD_DEPTH_SPAN_M either side of its own median.
+
+    The stride adapts unless `target_points` is 0, because a fixed stride
+    samples the image while the person lives in the world: the same person gave
+    ~1200 points at 1.5 m and ~300 at 3.2 m, and 300 is where the registration
+    began running out of correspondences to work with.  It never goes sparser
+    than the `stride` asked for.
+    """
+    target_points = (CLOUD_TARGET_POINTS if target_points is None
+                     else target_points)
+    m8 = np.ascontiguousarray(mask).astype(np.uint8)
+    if CLOUD_ERODE_PX > 0:
+        k = 2 * CLOUD_ERODE_PX + 1
+        thin = cv2.erode(m8, np.ones((k, k), np.uint8))
+        # A limb can be narrower than the kernel.  Losing the outline is the
+        # point of this; losing the arm is not, so the erosion is kept only
+        # while most of the person survives it.
+        if cv2.countNonZero(thin) > 0.35 * cv2.countNonZero(m8):
+            m8 = thin
+    area = cv2.countNonZero(m8)
+    if area < 20:
+        return np.zeros((0, 3), np.float64)
+    if target_points:
+        stride = (1 if area <= target_points else
+                  int(min(stride, max(1, round(np.sqrt(area / target_points))))))
+    # Only over the person.  A finer stride over the whole frame spent most of
+    # its time on pixels the mask had already rejected: at 3.2 m the body is
+    # about a tenth of the image.
+    x0, y0, bw, bh = cv2.boundingRect(m8)
+    ys, xs = np.mgrid[y0:y0 + bh:stride, x0:x0 + bw:stride]
     z = depth_m[ys, xs]
-    m = (z > MINZ) & (z < MAXZ) & mask[ys, xs]
-    xs, ys, z = xs[m], ys[m], z[m]
+    ok = (z > MINZ) & (z < MAXZ) & (m8[ys, xs] > 0)
+    if ok.sum() < 20:
+        return np.zeros((0, 3), np.float64)
+
+    if CLOUD_SPIKE_M > 0:
+        # Each kept sample against the median of its eight grid neighbours.
+        # Deliberately on the sampled grid and not the full image: neighbours a
+        # stride apart straddle a depth step, and the pixel beside a flying
+        # pixel is usually another flying pixel.  Only the kept samples are
+        # gathered, so this is ~2k rows of nine, not the whole frame.
+        gh, gw = ok.shape
+        pad = np.full((gh + 2, gw + 2), np.nan, np.float32)
+        pad[1:-1, 1:-1] = np.where(ok, z, np.nan)
+        r, c = np.nonzero(ok)
+        nbr = np.stack([pad[r + dy, c + dx]
+                        for dy in (0, 1, 2) for dx in (0, 1, 2)], 1)
+        # The centre is one of the nine and is never NaN, so no all-NaN rows.
+        spike = np.abs(z[r, c] - np.nanmedian(nbr, axis=1)) > CLOUD_SPIKE_M
+        ok[r[spike], c[spike]] = False
+
+    if CLOUD_DEPTH_SPAN_M > 0 and ok.sum() >= 20:
+        r, c = np.nonzero(ok)
+        zs = z[r, c]
+        far = np.abs(zs - float(np.median(zs))) >= CLOUD_DEPTH_SPAN_M
+        # Only if something is left: a badly cropped person can be all tail.
+        if (~far).sum() >= 20:
+            ok[r[far], c[far]] = False
+
+    ys, xs, z = ys[ok], xs[ok], z[ok]
     x = (xs - K[0, 2]) * z / K[0, 0]
     y = (ys - K[1, 2]) * z / K[1, 1]
     return np.stack([x, y, z], 1).astype(np.float64)
@@ -651,6 +765,8 @@ def refine_to_cloud(verts, joints, cloud, vert_w=None, visible_idx=None,
     `vert_w` (6890,) weights the z-fit by per-vertex RELIABILITY (from sigma, see
     `vertex_fit_weights`): the depth locks to the joints the model trusts most."""
     if cloud is None or len(cloud) < 200:
+        LAST_REFINE.update(cloud=0 if cloud is None else len(cloud), matched=0,
+                           floor=200, dz=0.0, why="cloud too small")
         return verts, joints
     # dz is a WEIGHTED MEDIAN over every match, so decimating the cloud costs
     # precision only as sqrt(n).  Measured against the full ~15k-point cloud, a
@@ -667,6 +783,8 @@ def refine_to_cloud(verts, joints, cloud, vert_w=None, visible_idx=None,
     # and reuse it for both registration and rendering.
     vis = visible_vertices(v) if visible_idx is None else visible_idx
     if len(vis) < 50:
+        LAST_REFINE.update(cloud=len(cloud), matched=0, floor=0, dz=0.0,
+                           why="mesh barely visible")
         return verts, joints
     # The correction is a pure z-TRANSLATION of the mesh, so shifting the cloud by
     # -dz instead of the mesh by +dz leaves every pairwise distance unchanged.
@@ -678,10 +796,28 @@ def refine_to_cloud(verts, joints, cloud, vert_w=None, visible_idx=None,
     # ~2x faster to construct and no slower to query at these sizes.
     tree = cKDTree(vv, balanced_tree=False, compact_nodes=False)
     query = cloud
-    for _ in range(iters):
+    # Acquire wide, then refine.  The gate is there to stop the registration
+    # pairing the body with whatever else got into the cloud -- but it also
+    # decides whether the registration runs at all, and a mesh that has drifted
+    # past it cannot muster the correspondences to be pulled back, so it stays
+    # drifted.  That is a latch, not a threshold: measured over ten frames of
+    # one person at 3.2 m, nine had 25-76 matches inside 0.35 m against a floor
+    # of 100, broke out with dz=0, and were published sitting 24-29 cm in front
+    # of their own point cloud; the tenth had 292 and landed at 2 cm.  Every one
+    # of the nine had 265+ matches at 0.70 m.  So the first pass opens the gate
+    # wide enough to find the body again and the rest close it back down, while
+    # max_shift stays as the guard against pulling onto something that is not
+    # the body.  The floor is a fraction of the cloud because the absolute one
+    # silently became a third of it as the person walked away from the camera.
+    floor = max(ICP_MIN_MATCHES, int(ICP_MIN_MATCH_FRAC * len(cloud)))
+    matched = 0
+    why = "ok"
+    for gate in [max_corr * ICP_ACQUIRE_SCALE] + [max_corr] * iters:
         d, idx = tree.query(query, workers=-1)
-        m = d < max_corr
-        if m.sum() < 100:
+        m = d < gate
+        matched = int(m.sum())
+        if matched < floor:
+            why = "too few correspondences"
             break
         resid = query[m, 2] - vv[idx[m], 2]              # per-match depth residual
         w = vert_w[vis[idx[m]]] if vert_w is not None else None   # reliability weight
@@ -691,7 +827,10 @@ def refine_to_cloud(verts, joints, cloud, vert_w=None, visible_idx=None,
             break
         query = cloud.copy()
         query[:, 2] -= dz_total
+    LAST_REFINE.update(cloud=len(cloud), matched=matched, floor=floor,
+                       dz=float(dz_total), why=why)
     if abs(dz_total) > max_shift:
+        LAST_REFINE["why"] = "shift over the cap"
         return verts, joints
     ov, oj = verts.copy(), joints.copy()
     ov[:, 2] += dz_total; oj[:, 2] += dz_total
