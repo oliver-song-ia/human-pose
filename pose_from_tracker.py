@@ -496,6 +496,13 @@ def main():
     ap.add_argument("--root-max-speed", type=float, default=2.0,
                     help="metres per second the pelvis may move before it is "
                          "treated as an outlier and clamped.  Walking is ~1.5")
+    ap.add_argument("--root-smooth-hz", type=float, default=0.8,
+                    help="how still a standing-still person looks: the "
+                         "filter's cutoff when nothing is moving, in Hz. "
+                         "Lower is steadier and slower to react; 0 disables")
+    ap.add_argument("--root-smooth-beta", type=float, default=4.0,
+                    help="how quickly the smoothing gets out of the way once "
+                         "the person does move.  Too low and walking lags")
     ap.add_argument("--root-grace", type=int, default=10,
                     help="consecutive outlier frames before a jump is believed "
                          "and the mesh is allowed to teleport there.  The "
@@ -657,6 +664,10 @@ def main():
     tri = [None]
     bones = np.asarray(PIPE.SMPL_BONES, np.int32).reshape(-1)
     root_stab = PIPE.RootStabiliser(args.root_max_speed, args.root_grace)
+    # After the outlier rejection, not instead of it: one stops the body
+    # teleporting, the other stops it trembling while its owner sits still.
+    root_smooth = PIPE.OneEuro(args.root_smooth_hz, args.root_smooth_beta)
+    facing_smooth = PIPE.OneEuro(args.root_smooth_hz, args.root_smooth_beta)
     shown = [False]
     last_mesh_t = [0.0]
     last_others_t = [0.0]
@@ -830,6 +841,8 @@ def main():
         # Whoever this was is gone, so every filter that assumed one person
         # is now stale.
         root_stab.reset()
+        root_smooth.reset()
+        facing_smooth.reset()
         ML.reset_betas_state()
 
     def instance_of(det):
@@ -896,6 +909,7 @@ def main():
         if root is not None:
             blended = PIPE.blend_root(root, PIPE.MODEL_CAM_T, K)
             root = root_stab(blended)
+            root = root_smooth(root)
             # What the depth said before anything smoothed it, against what
             # came out: a body that teleports on screen is one of these two
             # moving, and they are not the same failure.
@@ -937,6 +951,14 @@ def main():
         root_why[lroot["why"]] += 1
         root_gap.append(abs(lroot["model"] - lroot["depth"]))
         forward = PIPE.body_forward(joints_m)
+        if forward is not None:
+            # The arrow and the mesh's facing wobbled 1.2 deg a frame on a
+            # motionless person.  Filter the direction and re-normalise; the
+            # same speed-adaptive rule, so turning round is still immediate.
+            sm = facing_smooth(np.asarray(forward, np.float64))
+            nrm = float(np.linalg.norm(sm))
+            if nrm > 1e-6:
+                forward = (sm / nrm).astype(np.float32)
         prof["ground"] += (time.monotonic() - t_stage) * 1e3
 
         # ---- output frame ------------------------------------------------
@@ -1251,6 +1273,8 @@ def main():
                         "resetting the body filters")
                 clear()
                 root_stab.reset()
+                root_smooth.reset()
+                facing_smooth.reset()
                 ML.reset_betas_state()
             elif st["target"] != last_target[0]:
                 node.get_logger().info(

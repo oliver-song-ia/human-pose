@@ -949,6 +949,59 @@ def largest_person(res, hw):
     return box, mask
 
 
+class OneEuro:
+    """Jitter filter whose strength depends on how fast the thing is moving.
+
+    RootStabiliser rejects the impossible but passes everything else through
+    untouched, which is right for a teleport and useless for a tremor: with a
+    person sitting still the published root moved 2.5 cm per frame (p50) and
+    its steps were negatively autocorrelated (-0.38 on y, -0.39 on z), the
+    signature of noise being over-corrected rather than of anybody moving.
+
+    A fixed low-pass would fix that and lag real motion, which is the trade
+    RootStabiliser's docstring rejects.  This is the usual way out of it: the
+    cutoff rises with the observed speed, so standing still is smoothed hard
+    and walking is barely touched.  `beta` is how quickly it gets out of the
+    way; `min_cutoff` is how still "still" looks.
+    """
+
+    def __init__(self, min_cutoff=0.8, beta=4.0, d_cutoff=1.0):
+        self.min_cutoff = float(min_cutoff)
+        self.beta = float(beta)
+        self.d_cutoff = float(d_cutoff)
+        self.reset()
+
+    def reset(self):
+        self.x_prev = None
+        self.dx_prev = None
+        self.t_prev = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * np.pi * max(cutoff, 1e-6))
+        return 1.0 / (1.0 + tau / max(dt, 1e-6))
+
+    def __call__(self, x, now=None):
+        if x is None:
+            return None
+        if self.min_cutoff <= 0.0:
+            return np.asarray(x, np.float32)     # disabled
+        x = np.asarray(x, np.float64)
+        now = time.perf_counter() if now is None else now
+        if self.x_prev is None:
+            self.x_prev, self.dx_prev, self.t_prev = x.copy(), np.zeros_like(x), now
+            return x.astype(np.float32)
+        dt = max(now - self.t_prev, 1e-3)
+        self.t_prev = now
+        dx = (x - self.x_prev) / dt
+        a_d = self._alpha(self.d_cutoff, dt)
+        self.dx_prev = a_d * dx + (1.0 - a_d) * self.dx_prev
+        speed = float(np.linalg.norm(self.dx_prev))
+        a = self._alpha(self.min_cutoff + self.beta * speed, dt)
+        self.x_prev = a * x + (1.0 - a) * self.x_prev
+        return self.x_prev.astype(np.float32)
+
+
 class RootStabiliser:
     """Rate-limit the metric root, so outliers cannot teleport the mesh.
 
