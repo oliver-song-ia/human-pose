@@ -517,7 +517,7 @@ def main():
 
     rgb_buf, depth_buf = StampBuffer(CAM_QUEUE), StampBuffer(CAM_QUEUE)
     st = {"K": None, "cam_frame": None, "instances": None, "instances_t": 0.0,
-          "labels": {}, "tracks": {}, "target": -1}
+          "labels": {}, "tracks": {}, "target": -1, "epoch": None}
 
     # The fit loop sleeps between frames, and what it is waiting for is one of
     # these callbacks.  Polling for them on a timer costs half the poll
@@ -565,6 +565,14 @@ def main():
     node.create_subscription(Image, args.instance_mask, on_labels, cam_qos)
     node.create_subscription(Detection2DArray, args.tracks, on_tracks, cam_qos)
     node.create_subscription(Int32, args.target, on_target, 10)
+
+    def on_epoch(m):
+        st["epoch"] = int(m.data)
+
+    # Which person the target is, as opposed to which track id they are wearing
+    # this second.  Absent if the tracker predates it, in which case the id has
+    # to stand in for identity again -- see the reset below.
+    node.create_subscription(Int32, f"{args.target}_epoch", on_epoch, 10)
     PIPE.subscribe_camera(
         node, cam_qos, on_rgb, depth_buf.push,
         lambda m: st.update(K=np.array(m.k, np.float32).reshape(3, 3)))
@@ -603,6 +611,7 @@ def main():
     people_shown = [set()]        # marker ids currently up in the "people" ns
     reset_sent = [False]          # whether a previous run's markers were wiped
     last_target = [None]
+    last_epoch = [None]
     why = Counter()
     prev_root, prev_raw = [None], [None]
     jumps = {"in": deque(maxlen=600), "out": deque(maxlen=600)}
@@ -1157,15 +1166,30 @@ def main():
             # markers go too: holding the previous person's body for
             # --idle-hold while the target is somebody else is the wrong body
             # in the wrong place.
-            if st["target"] != last_target[0]:
+            # A different PERSON is a different body, and every filter here
+            # assumes one.  A different track id is not that: BoT-SORT issues a
+            # fresh id to somebody who steps off the frame edge and turns
+            # around, and the tracker's appearance test then puts the target
+            # back on it -- the same person, still standing where they were.
+            # Resetting for that threw away the smoothing and blinked the mesh
+            # out and in several times a minute, which is most of what "the
+            # mesh keeps flickering" was.  The tracker says which kind of
+            # change it is; only its epoch starts anything over.
+            changed = (st["target"] != last_target[0] if st["epoch"] is None
+                       else st["epoch"] != last_epoch[0])
+            if changed:
                 if last_target[0] is not None:
                     node.get_logger().info(
                         f"target #{last_target[0]} -> #{st['target']}: "
                         "resetting the body filters")
-                last_target[0] = st["target"]
                 clear()
                 root_stab.reset()
                 ML.reset_betas_state()
+            elif st["target"] != last_target[0]:
+                node.get_logger().info(
+                    f"target #{last_target[0]} -> #{st['target']}: same person, "
+                    "keeping the body")
+            last_target[0], last_epoch[0] = st["target"], st["epoch"]
 
             # ---- the target first, and alone ---------------------------------
             # Whoever is designated is the only body anybody is looking at, so
