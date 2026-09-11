@@ -115,6 +115,10 @@ CAM_QUEUE = 45
 # reads a fraction of it.
 NOMINAL_FILL = 0.39
 
+# What a person is, in metres, for turning a distance into "how many pixels
+# tall should they be".  Only the ratio matters, so the exact figure does not.
+PERSON_HEIGHT_M = 1.7
+
 # Everyone's bodies go out as one cloud: 24 SMPL joints then the crown, w
 # carrying the instance id they belong to.  The crown is the highest mesh
 # vertex within HEAD_RADIUS_M of the head joint -- it travels with the joints
@@ -128,15 +132,48 @@ J_HEAD = 15
 
 
 def visible_fraction(mask_px: int, box_area: float) -> float:
-    """How much of a person is showing; 1.0 for somebody in the clear.
+    """What the mask covers of its own box; 1.0 for a solid silhouette.
 
-    Comparing the mask against its own box is what makes this scale-free.  The
-    box on its own says nothing: it shrinks with the visible part of a person,
-    so a mostly hidden one still fills the box it got.
+    This catches something standing in front of a person: the detector still
+    draws the box around the whole of them, and the mask comes back with a
+    hole in it.  It cannot catch a person who is merely CROPPED -- the box is
+    drawn round whatever is visible, so somebody showing only their head fills
+    that box and reads 1.00 here.  visible_height_fraction is for that.
     """
     if box_area <= 0.0:
         return 0.0
     return min(1.0, (mask_px / box_area) / NOMINAL_FILL)
+
+
+def visible_height_fraction(mask: np.ndarray, depth_m: np.ndarray,
+                            fy: float) -> float:
+    """How much of a person's own length is in view, 1.0 for all of them.
+
+    Depth is what makes this possible: the camera says how many pixels a
+    PERSON_HEIGHT_M person spans at the distance the mask actually sits, and
+    the mask's longest extent says how much of that is there.  Measured live,
+    real people -- including seated ones with their legs behind a desk -- read
+    0.65 to 0.70, while a 48x17 fragment of a person read 0.12.
+
+    The longest extent rather than the height, so somebody lying down is not
+    rejected for being short, and the test only ever grows more permissive
+    when it is unsure.
+    """
+    if fy <= 0.0:
+        return 1.0
+    rows, cols = mask.any(axis=1), mask.any(axis=0)
+    ys, xs = np.flatnonzero(rows), np.flatnonzero(cols)
+    if not len(ys) or not len(xs):
+        return 1.0
+    extent = float(max(ys[-1] - ys[0] + 1, xs[-1] - xs[0] + 1))
+    # A median over every fourth pixel: this only needs the distance to the
+    # person, not a depth image.
+    z = depth_m[::4, ::4][mask[::4, ::4] > 0]
+    z = z[(z > 0.3) & (z < 10.0)]
+    if not len(z):
+        return 1.0
+    expected = fy * PERSON_HEIGHT_M / float(np.median(z))
+    return 1.0 if expected <= 0.0 else float(extent / expected)
 
 
 def crown_of(verts: np.ndarray, joints: np.ndarray) -> np.ndarray:
@@ -360,6 +397,13 @@ def main():
     ap.add_argument("--target", default="/tracker/target",
                     help="the track id whose body is grounded, refined and "
                          "drawn; everyone else gets joints only")
+    ap.add_argument("--min-visible-height", type=float, default=0.35,
+                    help="skip anybody less of whose own length is in view "
+                         "than this, measured against how tall a person is at "
+                         "the distance depth puts them.  Real people read "
+                         "0.65-0.70 here, seated ones included; a head-sized "
+                         "fragment reads 0.12, and fitting one hands TokenHMR "
+                         "a crop it can only hallucinate a body from")
     ap.add_argument("--max-occlusion", type=float, default=0.8,
                     help="skip the fit for anybody hidden by more than this "
                          "fraction of what an unoccluded person's mask covers")
@@ -605,7 +649,7 @@ def main():
     def instance_of(det):
         return int(det.id) if str(det.id).isdigit() else 0
 
-    def fit_one(det, labels, rgb):
+    def fit_one(det, labels, rgb, depth_m, fy):
         """TokenHMR for one detection, or None if there is too little of them.
 
         Returns the instance id, the joints, the mesh, and the extras only the
@@ -622,7 +666,9 @@ def main():
         px = int(mask.sum())
         area = max(float(bb.size_x * bb.size_y), 1.0)
         if (px < args.min_mask_px
-                or visible_fraction(px, area) < 1.0 - args.max_occlusion):
+                or visible_fraction(px, area) < 1.0 - args.max_occlusion
+                or visible_height_fraction(mask, depth_m, fy)
+                   < args.min_visible_height):
             return None
         verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
             eng, tf_model, rgb, box, device)
@@ -865,7 +911,9 @@ def main():
 
             t_stage = time.monotonic()
             bodies = []
-            got = fit_one(target_det, labels, rgb) if target_det else None
+            fy = float(K[1, 1]) if K is not None else 0.0
+            got = (fit_one(target_det, labels, rgb, depth_m, fy)
+                   if target_det else None)
             prof["fit"] += (time.monotonic() - t_stage) * 1e3
             placed = None
             if got is None:
@@ -896,7 +944,7 @@ def main():
                 for det in crowd:
                     if det is target_det:
                         continue
-                    other = fit_one(det, labels, rgb)
+                    other = fit_one(det, labels, rgb, depth_m, fy)
                     if other is not None:
                         bodies.append(
                             (other[0], other[1], crown_of(other[2], other[1])))
