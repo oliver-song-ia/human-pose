@@ -601,6 +601,7 @@ def main():
     last_drawn = [0.0]
     last_people_t = [0.0]
     people_shown = [set()]        # marker ids currently up in the "people" ns
+    reset_sent = [False]          # whether a previous run's markers were wiped
     last_target = [None]
     why = Counter()
     prev_root, prev_raw = [None], [None]
@@ -711,6 +712,41 @@ def main():
             arr.markers.append(m)
         pub_people.publish(arr)
         people_shown[0] = set()
+
+    def reset_stale_markers():
+        """Wipe whatever a previous run of this node left on screen.
+
+        Nothing here sets Marker.lifetime, so every body the last instance drew
+        is still in RViz -- and tidying up on the way out cannot help when the
+        way out was a crash or a kill.  Doing it on the way IN always can.  It
+        fires once, as soon as somebody is actually listening, because that is
+        the first moment a DELETEALL is guaranteed to be heard rather than
+        dropped into a topic with no subscribers.
+        """
+        if reset_sent[0]:
+            return
+        if (pub_joints.get_subscription_count()
+                + pub_people.get_subscription_count()) == 0:
+            return
+        frame = st["cam_frame"] or args.world_frame
+        stamp = node.get_clock().now().to_msg()
+
+        def wipe(ns_name):
+            m = Marker()
+            m.header.frame_id, m.header.stamp = frame, stamp
+            m.ns, m.action = ns_name, Marker.DELETEALL
+            return m
+
+        for pub in (pub_mesh, pub_facing, pub_joints):
+            pub.publish(wipe("human"))
+        arr = MarkerArray()
+        arr.markers.append(wipe("people"))
+        pub_people.publish(arr)
+        people_shown[0] = set()
+        shown[0] = False
+        reset_sent[0] = True
+        node.get_logger().info(
+            "cleared any markers left over from a previous run")
 
     def go_idle():
         """Nothing to draw this frame.  Usually that is not news.
@@ -1049,6 +1085,7 @@ def main():
             loop_t0 = time.monotonic()
             if args.run_seconds and loop_t0 - t_start > args.run_seconds:
                 break
+            reset_stale_markers()        # one-shot, self-disabling
 
             inst_msg, K = st["instances"], st["K"]
             if (inst_msg is None or K is None
@@ -1260,7 +1297,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        # Both namespaces: clear() is the target's three markers, and everybody
+        # else's skeletons were being left on screen at every exit.
         clear()
+        clear_people()
         print(f"pose_from_tracker: {fits} fits, {idles} idle, {skips} "
               f"unpaired (rgb {skip_rgb[0]} / depth {skip_depth[0]})", flush=True)
         node.destroy_node()
