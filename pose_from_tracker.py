@@ -28,7 +28,7 @@ a message is latency added to it:
 
 Measured on an RTX 4070 with two people in frame, camera stamp to the
 skeleton on the wire, not counting the camera driver's own 30-45 ms:
-54 ms median / 75 p90 headless, 67 / 81 with RViz attached.
+51 ms median / 72 p90 headless, 66 / 77 with RViz attached.
 
   in   /tracker/instances      vision_msgs/Detection2DArray -- the gate: class,
                                score and instance id per detection
@@ -143,33 +143,89 @@ def crown_of(verts: np.ndarray, joints: np.ndarray) -> np.ndarray:
     return near[near[:, 1].argmin()] if len(near) else joints[J_HEAD]
 
 
-def decimate_topology(verts: np.ndarray, faces: np.ndarray,
-                      target_faces: int) -> np.ndarray:
-    """A coarser triangulation of the same body, as flat TRIANGLE_LIST indices.
+def decimate_smpl(verts: np.ndarray, faces: np.ndarray, target_faces: int,
+                  max_rounds: int = 40) -> np.ndarray:
+    """A coarser SMPL topology, as flat TRIANGLE_LIST indices into `verts`.
 
     RViz's TRIANGLE_LIST has no index buffer, so every triangle spells out its
-    three corners and SMPL's 13776 faces become 41328 points -- 100 ms a frame
-    of building Python objects, which was the entire latency budget.  Quadric
-    decimation runs once, on the first body fitted; each simplified vertex is
-    then snapped to the SMPL vertex it sits on, which turns the result into an
-    index map that any later pose can be read through.  Topology is fixed
-    across poses and shapes, so once is enough.
+    three corners and SMPL's 13776 faces become 41328 Point objects -- more
+    pure Python per frame than the fit and the grounding together.  Coarser
+    costs less, and the body has to stay driven by the original vertices,
+    since those are what the next pose moves.
+
+    So the decimation runs along the mesh's own edges: an edge (u, w) is
+    collapsed by merging w *into* u, never into a new point between them.
+    Every surviving vertex is therefore an original SMPL vertex, and every
+    surviving triangle's corners were neighbours on the original surface.
+
+    The obvious alternative -- quadric decimation, then map each new vertex
+    back to the nearest SMPL vertex -- is what webbed the limbs to the torso:
+    "nearest" crosses from an arm to the body wherever the two surfaces come
+    close, and the triangle then stretches between them when the arm moves.
+    Distance cannot tell an arm from the chest behind it; connectivity can.
+
+    Only the ordering of collapses depends on the pose this is measured on, so
+    any fitted body will do.
     """
-    import open3d as o3d
-    from scipy.spatial import cKDTree
+    import heapq
 
     v = np.asarray(verts, np.float64)
-    mesh = o3d.geometry.TriangleMesh(
-        o3d.utility.Vector3dVector(v),
-        o3d.utility.Vector3iVector(np.asarray(faces, np.int32)))
-    small = mesh.simplify_quadric_decimation(target_number_of_triangles=target_faces)
-    _, idx = cKDTree(v).query(np.asarray(small.vertices))
-    tri = idx.astype(np.int32)[np.asarray(small.triangles, np.int32)]
-    # Two simplified vertices can land on one SMPL vertex.  The triangle
-    # between them has no area and nothing but cost.
-    keep = ((tri[:, 0] != tri[:, 1]) & (tri[:, 1] != tri[:, 2])
-            & (tri[:, 0] != tri[:, 2]))
-    return tri[keep].reshape(-1)
+    F = np.asarray(faces, np.int32).copy()
+    alive = np.ones(len(F), bool)
+    count = len(F)
+    if target_faces <= 0 or target_faces >= count:
+        return F.reshape(-1)
+
+    for _ in range(max_rounds):
+        if count <= target_faces:
+            break
+        # Neighbours and edges, rebuilt from the faces still alive.  A pass
+        # can only consume the edges it started with, so passes repeat until
+        # one makes no progress.
+        nbr, vfaces = {}, {}
+        for fi in np.flatnonzero(alive):
+            f = F[fi]
+            for a in f:
+                vfaces.setdefault(int(a), set()).add(int(fi))
+            for a, b in ((f[0], f[1]), (f[1], f[2]), (f[0], f[2])):
+                nbr.setdefault(int(a), set()).add(int(b))
+                nbr.setdefault(int(b), set()).add(int(a))
+        heap = [(float(np.linalg.norm(v[a] - v[b])), a, b)
+                for a in nbr for b in nbr[a] if a < b]
+        heapq.heapify(heap)
+
+        before, dead = count, set()
+        while count > target_faces and heap:
+            _, u, w = heapq.heappop(heap)
+            if u in dead or w in dead:
+                continue
+            # On a closed surface an edge's endpoints share exactly the two
+            # opposite corners.  More than that and merging them folds the
+            # surface onto itself.
+            if len(nbr[u] & nbr[w]) > 2:
+                continue
+            if len(nbr[u]) < len(nbr[w]):
+                u, w = w, u
+            dead.add(w)
+            for fi in vfaces[w]:
+                if not alive[fi]:
+                    continue
+                F[fi] = np.where(F[fi] == w, u, F[fi])
+                f = F[fi]
+                if f[0] == f[1] or f[1] == f[2] or f[0] == f[2]:
+                    alive[fi] = False
+                    count -= 1
+                else:
+                    vfaces[u].add(fi)
+            for x in nbr[w]:
+                if x != u and x not in dead:
+                    nbr[u].add(x)
+                    nbr[x].discard(w)
+                    nbr[x].add(u)
+            nbr[u].discard(w)
+        if count == before:
+            break
+    return F[alive].reshape(-1)
 
 
 class PointPool:
@@ -325,16 +381,16 @@ def main():
                          "picture, not an input: drawing it every frame makes "
                          "the loop slower than the camera, and then every "
                          "skeleton queues behind a mesh")
+    ap.add_argument("--mesh-faces", type=int, default=2500,
+                    help="decimate the body to this many triangles before "
+                         "publishing it; 0 keeps SMPL's 13776, which costs "
+                         "41328 Point objects a frame")
     ap.add_argument("--others-hz", type=float, default=10.0,
                     help="how often the people who are not the target are "
                          "fitted, while there is a target.  They only feed "
                          "the gesture policy, which debounces over frames; "
                          "with nobody designated everyone is fitted every "
                          "frame instead")
-    ap.add_argument("--mesh-faces", type=int, default=2500,
-                    help="decimate the body to this many triangles before "
-                         "publishing it; 0 keeps SMPL's 13776, which costs "
-                         "41328 Point objects a frame")
     ap.add_argument("--publish-frame", choices=("camera", "world"),
                     default="camera",
                     help="'camera' is the optical frame itself and needs "
@@ -441,9 +497,9 @@ def main():
 
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
 
-    # Filled in from the first body fitted, because decimation needs a body to
-    # look at.  --mesh-faces 0 keeps SMPL's own topology.
-    tri = [np.asarray(faces, np.int32).reshape(-1)] if args.mesh_faces <= 0 else [None]
+    # Filled in from the first body fitted; the pose only orders the
+    # collapses, it cannot change what is legal to collapse.
+    tri = [None]
     bones = np.asarray(PIPE.SMPL_BONES, np.int32).reshape(-1)
     root_stab = PIPE.RootStabiliser(PIPE.MAX_ROOT_SPEED, PIPE.ROOT_JUMP_GRACE)
     shown = [False]
@@ -638,14 +694,11 @@ def main():
     def publish_mesh(verts_m, out_frame, stamp, loop_t0, prof):
         """The body as a picture, sent after everything a machine reads.
 
-        A TRIANGLE_LIST spells out every triangle's three corners, so even the
-        decimated body is thousands of Point objects; whatever that costs, it
-        costs after the pose and the skeleton have gone.
-
-        And only when somebody is looking.  The loop is the thing standing
-        between a camera frame and the skeleton downstream reads, and a body
-        drawn for nobody would push the next frame's skeleton back by the time
-        it took to draw.
+        On this loop, not a thread of its own: filling a Marker is pure Python
+        and holds the GIL, so a drawing thread does not overlap with the fit,
+        it interleaves with it.  Measured: the fit went from 13 ms to 30 and
+        the skeleton's p90 from 80 ms to 156.  Cheap and in line beats
+        expensive and parallel here.
         """
         if pub_mesh.get_subscription_count() == 0:
             return
@@ -654,10 +707,12 @@ def main():
         t_stage = time.monotonic()
         last_mesh_t[0] = loop_t0
         if tri[0] is None:
-            tri[0] = decimate_topology(verts_m, faces, args.mesh_faces)
+            t0 = time.monotonic()
+            tri[0] = decimate_smpl(verts_m, faces, args.mesh_faces)
             node.get_logger().info(
                 f"mesh decimated to {len(tri[0]) // 3} faces "
-                f"({len(tri[0])} points, SMPL has {len(faces)})")
+                f"({len(tri[0])} points, SMPL has {len(faces)}) in "
+                f"{(time.monotonic() - t0) * 1e3:.0f} ms")
         mm = marker(0, Marker.TRIANGLE_LIST, out_frame, stamp,
                     (1.0, 1.0, 1.0),
                     ColorRGBA(r=0.10, g=0.85, b=0.55, a=0.95))
@@ -815,14 +870,14 @@ def main():
                 last_logged[0] = fits
                 age = (node.get_clock().now().nanoseconds - key) / 1e6
                 stages = "  ".join(f"{k} {prof[k] / 30.0:.1f}" for k in PROF_KEYS)
-                def ages(key, label):
-                    v = prof[key]
+                def ages(v, label):
                     return (f"{label} {np.median(v):.0f}/{np.percentile(v, 90):.0f} "
-                            f"(p50/p90) ms  " if v else "")
+                            f"(p50/p90) ms  " if len(v) else "")
                 print(f"[PoseProfile] {stages}  |  "
                       f"{(time.monotonic() - loop_t0) * 1e3:.0f} ms/fit  "
-                      f"{ages('pose_age', 'skeleton-age')}"
-                      f"{ages('mesh_age', 'mesh-age')}frame-age {age:.0f} ms  "
+                      f"{ages(prof['pose_age'], 'skeleton-age')}"
+                      f"{ages(prof['mesh_age'], 'mesh-age')}"
+                      f"frame-age {age:.0f} ms  "
                       f"fits={fits} idle={idles} skip={skips} "
                       f"(rgb {skip_rgb[0]} / depth {skip_depth[0]})", flush=True)
                 prof = new_prof()
