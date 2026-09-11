@@ -53,6 +53,12 @@ Notes on the contract:
     "nobody" from "the publisher died"; this node treats an instance array
     older than --tracker-timeout as the second.
 
+  * A frame the target could not be fitted on is neither.  It is a tracks
+    message that did not arrive for that stamp, or a mask a hair too small,
+    and --idle-hold keeps the last body up across it -- 33 ms stale beats
+    blinking, and the temporal filters keep the state that one dropped frame
+    must not throw away.
+
   * The mask and the colour frame must be paired by stamp.  The mask indexes
     the frame it was computed from; applying it to whichever colour frame is
     newest shifts it by a frame of motion, worst exactly when the person moves.
@@ -381,6 +387,10 @@ def main():
                          "picture, not an input: drawing it every frame makes "
                          "the loop slower than the camera, and then every "
                          "skeleton queues behind a mesh")
+    ap.add_argument("--idle-hold", type=float, default=0.5,
+                    help="keep the last body on screen for this long when the "
+                         "target cannot be fitted; below it a dropped frame "
+                         "reads as a departure and the body blinks")
     ap.add_argument("--mesh-faces", type=int, default=2500,
                     help="decimate the body to this many triangles before "
                          "publishing it; 0 keeps SMPL's 13776, which costs "
@@ -505,6 +515,7 @@ def main():
     shown = [False]
     last_mesh_t = [0.0]
     last_others_t = [0.0]
+    last_drawn = [0.0]
     last_logged = [0]
     mesh_pool, bone_pool = PointPool(), PointPool()
 
@@ -566,8 +577,23 @@ def main():
         shown[0] = False
 
     def go_idle():
+        """Nothing to draw this frame.  Usually that is not news.
+
+        A frame the target could not be fitted on is not a departure: it is a
+        tracks message that did not arrive for this stamp, or a mask a hair
+        too small.  Deleting the markers for that made the body blink in and
+        out at half the frame rate, and resetting the temporal filters threw
+        away smoothing state over one dropped frame.
+
+        Departure is the tracker's call, and it says so by publishing -1.
+        Until then the last body stays up, and only --idle-hold of continuous
+        silence takes it down.
+        """
+        if st["target"] >= 0 and time.monotonic() - last_drawn[0] < args.idle_hold:
+            return
         clear()
-        # The lock is gone, so every filter that assumed one person is stale.
+        # Whoever this was is gone, so every filter that assumed one person
+        # is now stale.
         root_stab.reset()
         ML.reset_betas_state()
 
@@ -683,6 +709,7 @@ def main():
         jm.points = bone_pool.fill(joints_m[bones])
         pub_joints.publish(jm)
         shown[0] = True
+        last_drawn[0] = time.monotonic()
         prof["markers"] += (time.monotonic() - t_stage) * 1e3
         # The skeleton's own age, which is the number that matters: this is
         # what downstream consumes, and it is on the wire now.
