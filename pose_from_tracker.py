@@ -17,11 +17,15 @@ a message is latency added to it:
 
   1. the target, fitted alone -- a second person in frame must not put their
      own fit in front of the body somebody is acting on
-  2. the target grounded and refined, then ~/human_pose, ~/human_joints and
-     ~/human_facing, which are what downstream reads
-  3. everyone else, for the gesture policy, at --others-hz while there is a
+  2. everyone else, for the gesture policy, at --others-hz while there is a
      target (they are secondary then); every frame when there is not
-  4. ~/joints, everybody's raw joints
+  3. ~/joints, everybody's raw joints.  This is the gesture policy's input and
+     the regressor has already answered it: whether a wrist is above a crown
+     is settled inside one body, and nothing below can change it.  So it goes
+     out before any of it.
+  4. the target grounded against depth and registered onto its own point
+     cloud, then ~/human_pose, ~/human_joints and ~/human_facing.  Only the
+     target: nobody else's metric placement is being acted on.
   5. ~/human_mesh last, and only when something is subscribed to it.  It is a
      picture: 2500 decimated triangles are still 7500 Point objects, and a
      body drawn for nobody would push the next frame's skeleton back.
@@ -88,7 +92,7 @@ import argparse
 import sys
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 import numpy as np
@@ -435,6 +439,19 @@ def main():
                          "picture, not an input: drawing it every frame makes "
                          "the loop slower than the camera, and then every "
                          "skeleton queues behind a mesh")
+    ap.add_argument("--root-max-speed", type=float, default=2.0,
+                    help="metres per second the pelvis may move before it is "
+                         "treated as an outlier and clamped.  Walking is ~1.5")
+    ap.add_argument("--root-grace", type=int, default=10,
+                    help="consecutive outlier frames before a jump is believed "
+                         "and the mesh is allowed to teleport there.  The "
+                         "depth-plus-model root is noisy -- measured, it moves "
+                         "86 cm between frames at p99 -- and at the stock 3 "
+                         "frames any excursion lasting 0.15 s got through and "
+                         "was published as a body jumping across the room.  At "
+                         "10 it has to hold for half a second, which an "
+                         "outlier does not and a person walking out of an "
+                         "occlusion does")
     ap.add_argument("--idle-hold", type=float, default=0.5,
                     help="keep the last body on screen for this long when the "
                          "target cannot be fitted; below it a dropped frame "
@@ -570,13 +587,16 @@ def main():
     # collapses, it cannot change what is legal to collapse.
     tri = [None]
     bones = np.asarray(PIPE.SMPL_BONES, np.int32).reshape(-1)
-    root_stab = PIPE.RootStabiliser(PIPE.MAX_ROOT_SPEED, PIPE.ROOT_JUMP_GRACE)
+    root_stab = PIPE.RootStabiliser(args.root_max_speed, args.root_grace)
     shown = [False]
     last_mesh_t = [0.0]
     last_others_t = [0.0]
     last_drawn = [0.0]
     last_people_t = [0.0]
     last_target = [None]
+    why = Counter()
+    prev_root, prev_raw = [None], [None]
+    jumps = {"in": deque(maxlen=600), "out": deque(maxlen=600)}
     last_logged = [0]
     mesh_pool, bone_pool = PointPool(), PointPool()
 
@@ -708,10 +728,22 @@ def main():
 
         t_stage = time.monotonic()
         forward = PIPE.body_forward(joints)
-        root = PIPE.metric_root(pelvis_px, depth_m, K, mask,
-                                PIPE.root_offset_for(forward))
+        raw_root = PIPE.metric_root(pelvis_px, depth_m, K, mask,
+                                    PIPE.root_offset_for(forward))
+        root = raw_root
         if root is not None:
-            root = root_stab(PIPE.blend_root(root, PIPE.MODEL_CAM_T, K))
+            blended = PIPE.blend_root(root, PIPE.MODEL_CAM_T, K)
+            root = root_stab(blended)
+            # What the depth said before anything smoothed it, against what
+            # came out: a body that teleports on screen is one of these two
+            # moving, and they are not the same failure.
+            if root is not None and prev_root[0] is not None:
+                jumps["out"].append(float(np.linalg.norm(root - prev_root[0])))
+            if prev_raw[0] is not None:
+                jumps["in"].append(float(np.linalg.norm(blended - prev_raw[0])))
+            prev_raw[0] = blended
+            if root is not None:
+                prev_root[0] = root.copy()
         if root is None:
             prof["ground"] += (time.monotonic() - t_stage) * 1e3
             return None
@@ -986,6 +1018,12 @@ def main():
             track_of = st["tracks"].get(key, {})
             target_instance = next(
                 (i for i, t in track_of.items() if t == st["target"]), None)
+            if st["target"] < 0:
+                why["none designated"] += 1
+            elif not track_of:
+                why["no tracks for this stamp"] += 1
+            elif target_instance is None:
+                why["target not tracked this frame"] += 1
 
             # A different person is a different body, and every filter here
             # assumes one.  The root stabiliser exists to reject a pelvis that
@@ -1028,14 +1066,12 @@ def main():
             if got is None:
                 # Nobody designated, or the designated one is not fittable this
                 # frame.  The others are still worth fitting, below.
+                if st["target"] >= 0 and target_instance is not None:
+                    why["target too hidden to fit"] += 1
                 idles += 1
                 go_idle()
             else:
                 bodies.append((got[0], got[1], crown_of(got[2], got[1])))
-                placed = place_target(got, depth_m, K, inst_msg.header.stamp,
-                                      prof)
-                if placed is not None:
-                    fits += 1
 
             # ---- everybody else, for the gesture policy ----------------------
             # Raw joints are all a raised hand needs -- it is a comparison
@@ -1059,9 +1095,29 @@ def main():
                         bodies.append(
                             (other[0], other[1], crown_of(other[2], other[1])))
             prof["others"] += (time.monotonic() - t_stage) * 1e3
+
+            # ---- everybody's joints, before anything is registered ----------
+            # The gesture policy reads these, and a raised hand is a
+            # comparison inside one body: it is answered by the pose the
+            # regressor already returned, and none of the depth registration
+            # below can change the answer.  So it goes out first -- putting
+            # ~14 ms of grounding and refinement in front of the wave decision
+            # bought nothing.
             t_stage = time.monotonic()
             publish_bodies(bodies, inst_msg.header)
             prof["joints"] += (time.monotonic() - t_stage) * 1e3
+
+            # ---- and only now, the one person we are following --------------
+            # Standing a body on the floor and registering it onto its own
+            # point cloud is the expensive half, and it is done for the target
+            # alone: nobody else's metric placement is being acted on.
+            if got is not None:
+                placed = place_target(got, depth_m, K, inst_msg.header.stamp,
+                                      prof)
+                if placed is not None:
+                    fits += 1
+                else:
+                    why["depth could not place the target"] += 1
 
             # Last, and only now: the pictures.  Everything a consumer acts
             # on has already gone out.
@@ -1083,7 +1139,18 @@ def main():
                       f"{ages(prof['mesh_age'], 'mesh-age')}"
                       f"frame-age {age:.0f} ms  "
                       f"fits={fits} idle={idles} skip={skips} "
-                      f"(rgb {skip_rgb[0]} / depth {skip_depth[0]})", flush=True)
+                      f"(rgb {skip_rgb[0]} / depth {skip_depth[0]})  "
+                      + "  ".join(f"{k}={v}" for k, v in why.most_common()),
+                      flush=True)
+                why.clear()
+                if len(jumps["out"]) > 30:
+                    a, b = np.asarray(jumps["in"]), np.asarray(jumps["out"])
+                    print(f"[RootJump] depth said p50 {np.median(a)*100:.1f} "
+                          f"p99 {np.percentile(a,99)*100:.0f} max "
+                          f"{a.max()*100:.0f} cm  |  published p50 "
+                          f"{np.median(b)*100:.1f} p99 {np.percentile(b,99)*100:.0f} "
+                          f"max {b.max()*100:.0f} cm  (over {len(b)} frames)",
+                          flush=True)
                 prof = new_prof()
             left = period - (time.monotonic() - loop_t0)
             if left > 0:
