@@ -1,0 +1,131 @@
+tags: dev
+train: true
+test: false
+ckpt_path: null
+seed: null
+cls_id: 5
+DATASETS:
+  SUPPRESS_KP_CONF_THRESH: 0.3
+  FILTER_NUM_KP: 4
+  FILTER_NUM_KP_THRESH: 0.0
+  FILTER_REPROJ_THRESH: 31000
+  SUPPRESS_BETAS_THRESH: 3.0
+  SUPPRESS_BAD_POSES: true
+  POSES_BETAS_SIMULTANEOUS: true
+  FILTER_NO_POSES: false
+  TRAIN:
+    H36M-TRAIN-WMASK:
+      WEIGHT: 0.1
+    MPII-TRAIN-WMASK:
+      WEIGHT: 0.1
+    COCO-TRAIN-2014-WMASK-PRUNED:
+      WEIGHT: 0.1
+    COCO-TRAIN-2014-VITPOSE-REPLICATE-PRUNED12:
+      WEIGHT: 0.1
+    BEDLAM:
+      WEIGHT: 0.18
+    MPI-INF-TRAIN-PRUNED:
+      WEIGHT: 0.04
+    AVA-TRAIN-MIDFRAMES-1FPS-WMASK:
+      WEIGHT: 0.13
+    AIC-TRAIN-WMASK:
+      WEIGHT: 0.13
+    INSTA-TRAIN-WMASK:
+      WEIGHT: 0.12
+  VAL:
+    3DPW-TEST:
+      WEIGHT: 1.0
+  MOCAP: CMU-MOCAP
+  BETAS_REG: true
+  CONFIG:
+    SCALE_FACTOR: 0.3
+    ROT_FACTOR: 30
+    TRANS_FACTOR: 0.02
+    COLOR_SCALE: 0.2
+    ROT_AUG_RATE: 0.6
+    TRANS_AUG_RATE: 0.5
+    DO_FLIP: true
+    FLIP_AUG_RATE: 0.5
+    EXTREME_CROP_AUG_RATE: 0.1
+    EXTREME_CROP_AUG_LEVEL: 1
+extras:
+  ignore_warnings: false
+  enforce_tags: true
+  print_config: true
+SMPL:
+  DATA_DIR: data/body_models 
+  MODEL_PATH: data/body_models/smpl
+  GENDER: neutral
+  NUM_BODY_JOINTS: 23
+  JOINT_REGRESSOR_EXTRA: data/body_models/SMPL_to_J19.pkl
+  MEAN_PARAMS: data/body_models/smpl_mean_params.npz
+EXTRA:
+  FOCAL_LENGTH: 5000
+  NUM_LOG_IMAGES: 4
+  NUM_LOG_SAMPLES_PER_IMAGE: 8
+  PELVIS_IND: 39
+GENERAL:
+  TOTAL_STEPS: 350000
+  LOG_STEPS: 250
+  VAL_STEPS: 2000
+  CHECKPOINT_STEPS: 2000
+  CHECKPOINT_SAVE_TOP_K: 1
+  NUM_WORKERS: 6
+  PREFETCH_FACTOR: 2
+TRAIN:
+  LR: 5.0e-07
+  WEIGHT_DECAY: 0.0001
+  BATCH_SIZE: 48
+  LOSS_REDUCTION: mean
+  NUM_TRAIN_SAMPLES: 2
+  NUM_TEST_SAMPLES: 64
+  POSE_2D_NOISE_RATIO: 0.01
+  SMPL_PARAM_NOISE_RATIO: 0.005
+MODEL:
+  VAL_LOSS_SAVE_THRESH: 5
+  FROZEN_LEARNED: false
+  LORA: false
+  LOOSE_SUP: true
+  LOOSE_WEIGHT: 0.05
+  WITH_MLM: false
+  TOKENIZER_CHECKPOINT_PATH: data/checkpoints/tokenizer.pth
+  IMAGE_SIZE: 256
+  IMAGE_MEAN:
+  - 0.485
+  - 0.456
+  - 0.406
+  IMAGE_STD:
+  - 0.229
+  - 0.224
+  - 0.225
+  BACKBONE:
+    TYPE: vit
+    PRETRAINED_WEIGHTS: data/checkpoints/hmr2_pretrained.pth
+  SMPL_HEAD:
+    TYPE: token
+    IN_CHANNELS: 2048
+    PREDICT_HAND: true
+    TOKENIZER:
+      TOKEN_GRAD_FLOW: false
+      TRAIN_TOK: false
+      UPDATE_CB: false
+      TOKEN_CODE_DIM: 256
+      TOKEN_NUM: 160
+      TOKEN_CLASS_NUM: 2048
+      TOKENIZER_TYPE: Vanilla
+    TRANSFORMER_DECODER:
+      depth: 6
+      heads: 8
+      mlp_dim: 1024
+      dim_head: 64
+      dropout: 0.0
+      emb_dropout: 0.0
+      norm: layer
+      context_dim: 1280
+LOSS_WEIGHTS:
+  KEYPOINTS_3D: 0.05
+  KEYPOINTS_2D: 0.01
+  GLOBAL_ORIENT: 0.001
+  BODY_POSE: 0.001
+  BETAS: 0.0005
+  ADVERSARIAL: 0.0

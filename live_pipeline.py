@@ -40,10 +40,10 @@ HP = "/media/oliver/9a72b131-ff4a-4fc1-a6d5-53ef9c8524e1/code/human-pose"
 # so every machine needs its own; HUMAN_POSE_YOLO / _PT point at the local ones.
 YOLO_PT = os.environ.get(
     "HUMAN_POSE_YOLO_PT",
-    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903.pt")
+    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260908.pt")
 YOLO_ENGINE = os.environ.get(
     "HUMAN_POSE_YOLO",
-    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260903_rtx4070.engine")
+    "/home/oliver/Documents/semantic_perception/yolo26m-seg-custom_20260908_rtx4070.engine")
 YOLO_MODEL = YOLO_ENGINE if Path(YOLO_ENGINE).exists() else YOLO_PT
 # The engine is driven through yolo_trt_runtime rather than ultralytics: the
 # wrapper costs 0.2 ms on an RTX 4070 but 20-30 ms on a Jetson, where the host
