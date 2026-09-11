@@ -395,12 +395,17 @@ def main():
                     help="decimate the body to this many triangles before "
                          "publishing it; 0 keeps SMPL's 13776, which costs "
                          "41328 Point objects a frame")
-    ap.add_argument("--others-hz", type=float, default=10.0,
+    ap.add_argument("--others-hz", type=float, default=25.0,
                     help="how often the people who are not the target are "
-                         "fitted, while there is a target.  They only feed "
-                         "the gesture policy, which debounces over frames; "
-                         "with nobody designated everyone is fitted every "
-                         "frame instead")
+                         "fitted, while there is a target; with nobody "
+                         "designated everyone is fitted every frame anyway.  "
+                         "It is the rate at which a NEW waver is noticed, so "
+                         "it is not free to lower: at 10 Hz a second person "
+                         "was sampled at 7.8 Hz and needed 0.38 s to clear "
+                         "--wave-min-frames, against 0.17 s at 25, and the "
+                         "difference cost 1.2 ms of skeleton latency with one "
+                         "other person in frame.  The cost scales with how "
+                         "many there are, which --max-persons caps")
     ap.add_argument("--publish-frame", choices=("camera", "world"),
                     default="camera",
                     help="'camera' is the optical frame itself and needs "
