@@ -860,7 +860,9 @@ def main():
         vis_idx = PIPE.visible_vertices(verts_m, K, mask, depth_m)
         prof["g_vis"] += (time.monotonic() - t_sub) * 1e3
         t_sub = time.monotonic()
+        t_sub = time.monotonic()
         fit_cloud = PIPE.person_cloud(depth_m, mask, K)
+        prof["cloud"] += (time.monotonic() - t_sub) * 1e3
         publish_fit_cloud(fit_cloud, st["cam_frame"] or args.world_frame, stamp)
         verts_m, joints_m = PIPE.refine_to_cloud(
             verts_m, joints_m, fit_cloud,
@@ -1076,8 +1078,11 @@ def main():
     skip_rgb, skip_depth = [0], [0]
     # Where a fitted frame's time goes.  Kept always, not behind --verbose:
     # the loop is a latency budget and this is the only view of it.
+    # "ground" is the whole grounding stage; g_vis, cloud and g_refine are the
+    # three things inside it, listed separately because each was a suspect at
+    # some point and the split is what settled it.
     PROF_KEYS = ("decode", "fit", "ground", "mesh", "markers", "others",
-                 "joints", "people", "g_vis", "g_refine")
+                 "joints", "people", "g_vis", "cloud", "g_refine")
 
     def new_prof():
         p = {k: 0.0 for k in PROF_KEYS}
