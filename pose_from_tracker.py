@@ -147,14 +147,46 @@ def visible_fraction(mask_px: int, box_area: float) -> float:
     hole in it.  It cannot catch a person who is merely CROPPED -- the box is
     drawn round whatever is visible, so somebody showing only their head fills
     that box and reads 1.00 here.  visible_height_fraction is for that.
+
+    NOMINAL_FILL is a constant standing in for "solid", and it is the weaker
+    half of this pair.  Measured against ten real fits the bodies themselves
+    filled 0.35 of their box where the constant says 0.39, so a person with
+    nothing in front of them tops out near 0.90 -- and the detector's box is
+    looser than the silhouette, which takes it lower again.  Once
+    visible_height_fraction stopped mistaking posture for occlusion, THIS
+    became what limits the number a viewer sees, at about 0.75 for somebody
+    fully in view.
+
+    Deriving it per pose from the fitted body is the obvious repair and does
+    not work as a vertex-occupancy count: measured on one body, the same
+    silhouette read 0.11, 0.19, 0.27, 0.35 at 157, 313, 626 and 1252 vertices
+    and was still climbing, so the answer would depend on how many vertices it
+    was handed rather than on the person.  Rasterising the mesh triangles
+    would fix it and costs more than this whole test does; it has not been
+    done.
     """
     if box_area <= 0.0:
         return 0.0
     return min(1.0, (mask_px / box_area) / NOMINAL_FILL)
 
 
+def posture_extent_m(verts: np.ndarray) -> float:
+    """How long this body actually is, in metres, in the pose it is in.
+
+    SMPL is metric, and TokenHMR returns it in camera axes, so the vertical
+    span of the fitted vertices is the person's apparent length as the camera
+    sees them -- about 1.7 m standing, about 1.15 m sitting down.  Matching
+    visible_height_fraction's own convention, the longest axis is used, so a
+    body lying down is measured along its length rather than its thickness.
+    """
+    v = np.asarray(verts, np.float32).reshape(-1, 3)
+    if len(v) < 2:
+        return PERSON_HEIGHT_M
+    return float(max(np.ptp(v[:, 1]), np.ptp(v[:, 0])))
+
+
 def visible_height_fraction(mask: np.ndarray, depth_m: np.ndarray,
-                            fy: float) -> float:
+                            fy: float, body_m: float = PERSON_HEIGHT_M) -> float:
     """How much of a person's own length is in view, 1.0 for all of them.
 
     Depth is what makes this possible: the camera says how many pixels a
@@ -166,6 +198,13 @@ def visible_height_fraction(mask: np.ndarray, depth_m: np.ndarray,
     The longest extent rather than the height, so somebody lying down is not
     rejected for being short, and the test only ever grows more permissive
     when it is unsure.
+
+    `body_m` is what the span is measured against.  Left at PERSON_HEIGHT_M it
+    asks "how much of a STANDING person is in view", which is the right
+    question before anything has been fitted and the wrong one afterwards: an
+    unoccluded person sitting down spans about 70% of a standing one and was
+    being reported as 30% hidden.  Once a body has been fitted, pass its own
+    extent and the question becomes "how much of THIS person is in view".
     """
     if fy <= 0.0:
         return 1.0
@@ -173,14 +212,29 @@ def visible_height_fraction(mask: np.ndarray, depth_m: np.ndarray,
     ys, xs = np.flatnonzero(rows), np.flatnonzero(cols)
     if not len(ys) or not len(xs):
         return 1.0
-    extent = float(max(ys[-1] - ys[0] + 1, xs[-1] - xs[0] + 1))
+    tall = (ys[-1] - ys[0] + 1) >= (xs[-1] - xs[0] + 1)
+    # The span, discounted by how much of it actually contains any mask.  The
+    # span alone is the bounding box, and a bounding box does not know about
+    # the middle: a head showing above a monitor and legs showing under the
+    # desk are one instance whose box reaches nearly foot to crown, so the
+    # person reads as almost entirely in view while almost none of them is.
+    # Covered rows are what separates that from a solid silhouette, which
+    # measures 1.00 here -- a standing person's legs keep every row in range
+    # occupied, so this costs an ordinary body nothing.
+    if tall:
+        span = float(ys[-1] - ys[0] + 1)
+        covered = float(rows[ys[0]:ys[-1] + 1].mean())
+    else:
+        span = float(xs[-1] - xs[0] + 1)
+        covered = float(cols[xs[0]:xs[-1] + 1].mean())
+    extent = span * covered
     # A median over every fourth pixel: this only needs the distance to the
     # person, not a depth image.
     z = depth_m[::4, ::4][mask[::4, ::4] > 0]
     z = z[(z > 0.3) & (z < 10.0)]
     if not len(z):
         return 1.0
-    expected = fy * PERSON_HEIGHT_M / float(np.median(z))
+    expected = fy * body_m / float(np.median(z))
     return 1.0 if expected <= 0.0 else float(extent / expected)
 
 
@@ -809,6 +863,14 @@ def main():
             return visible, None
         verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
             eng, tf_model, rgb, box, device)
+        # Now that there is a body, ask the question properly.  The gate above
+        # had to use a standing person because there was nothing else to go on;
+        # this one knows how long the person actually is in the pose they are
+        # in, so sitting down stops reading as occlusion.  It can only be
+        # reported, never used to reject -- rejecting on it would mean fitting
+        # a body to decide whether to fit a body.
+        visible = min(fill, visible_height_fraction(
+            mask, depth_m, fy, posture_extent_m(verts)))
         return visible, (instance_of(det), np.asarray(joints, np.float32),
                          np.asarray(verts, np.float32), verts, joints,
                          pelvis_px, sigma, mask)
