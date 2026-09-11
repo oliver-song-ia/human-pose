@@ -600,6 +600,7 @@ def main():
     last_others_t = [0.0]
     last_drawn = [0.0]
     last_people_t = [0.0]
+    people_shown = [set()]        # marker ids currently up in the "people" ns
     last_target = [None]
     why = Counter()
     prev_root, prev_raw = [None], [None]
@@ -690,6 +691,26 @@ def main():
             m.ns, m.id, m.action = "human", mid, Marker.DELETE
             pub.publish(m)
         shown[0] = False
+
+    def clear_people():
+        """Take down everybody's markers, for when there is nobody left.
+
+        Not part of clear(): that fires on a target switch too, and the other
+        people in the room are still standing there when the target changes.
+        This is only for a frame with no humans in it at all, which is the one
+        case publish_people never sees -- the loop turns back before it.
+        """
+        if not people_shown[0]:
+            return
+        arr = MarkerArray()
+        for mid in people_shown[0]:
+            m = Marker()
+            m.header.frame_id = st["cam_frame"] or args.world_frame
+            m.header.stamp = node.get_clock().now().to_msg()
+            m.ns, m.id, m.action = "people", mid, Marker.DELETE
+            arr.markers.append(m)
+        pub_people.publish(arr)
+        people_shown[0] = set()
 
     def go_idle():
         """Nothing to draw this frame.  Usually that is not news.
@@ -896,12 +917,22 @@ def main():
         last_people_t[0] = loop_t0
         frame = st["cam_frame"] or args.world_frame
         arr = MarkerArray()
-        # Everything is redrawn every time, so last frame's people have to go
-        # -- otherwise somebody who left the room keeps a skeleton.
-        clear_all = Marker()
-        clear_all.header.frame_id, clear_all.header.stamp = frame, stamp
-        clear_all.ns, clear_all.action = "people", Marker.DELETEALL
-        arr.markers.append(clear_all)
+        drawn = set()
+
+        def mid_of(track, inst, second=False):
+            """A marker id that means the same person next frame.
+
+            Instance ids are frame-local -- the detector renumbers them
+            whenever it reorders -- so keying markers on them made a person's
+            skeleton and label change id under RViz for no reason, and forced
+            a DELETEALL of the whole namespace every publish to clean up after
+            it.  Track ids are the only identity that survives a frame
+            boundary.  Somebody not yet tracked gets a high, clearly separate
+            id off their instance; it is wrong next frame either way, but it
+            cannot collide with a real track.
+            """
+            base = track * 2 if track is not None else 100000 + inst * 2
+            return base + (1 if second else 0)
 
         for inst, visible, fit in people:
             track = track_of.get(inst)
@@ -920,16 +951,19 @@ def main():
                     verts_m, joints_m = PIPE.ground(verts, joints, root)
                     anchor = crown_of(verts_m, joints_m)
                     if not is_target:
-                        sk = marker(inst * 2, Marker.LINE_LIST, frame, stamp,
-                                    (0.012, 0.0, 0.0), colour)
+                        sk = marker(mid_of(track, inst), Marker.LINE_LIST,
+                                    frame, stamp, (0.012, 0.0, 0.0), colour)
                         sk.ns = "people"
                         sk.points = to_points(joints_m[bones])
                         arr.markers.append(sk)
+                        drawn.add(sk.id)
             if anchor is None:
                 continue          # no depth for them: nowhere to put a label
-            txt = marker(inst * 2 + 1, Marker.TEXT_VIEW_FACING, frame, stamp,
+            txt = marker(mid_of(track, inst, second=True),
+                         Marker.TEXT_VIEW_FACING, frame, stamp,
                          (0.0, 0.0, args.label_size), colour)
             txt.ns = "people"
+            drawn.add(txt.id)
             name = f"#{track}" if track is not None else f"i{inst}"
             txt.text = f"{name}  {visible * 100:.0f}%"
             # Y is down in the optical frame, so up is -y: the label floats
@@ -939,7 +973,17 @@ def main():
             txt.pose.position.z = float(anchor[2])
             arr.markers.append(txt)
 
-        if len(arr.markers) > 1:
+        # Only what actually left is deleted.  Wiping the namespace and
+        # redrawing it at --people-hz meant every person's marker was destroyed
+        # and recreated ten times a second; now a person who is still here is
+        # an in-place update, and a DELETE means somebody really has gone.
+        for mid in people_shown[0] - drawn:
+            gone_m = Marker()
+            gone_m.header.frame_id, gone_m.header.stamp = frame, stamp
+            gone_m.ns, gone_m.id, gone_m.action = "people", mid, Marker.DELETE
+            arr.markers.append(gone_m)
+        people_shown[0] = drawn
+        if arr.markers:
             pub_people.publish(arr)
         prof["people"] += (time.monotonic() - t_stage) * 1e3
 
@@ -1025,6 +1069,7 @@ def main():
             if labels is None or not humans:
                 idles += 1
                 go_idle()
+                clear_people()
                 last_key = key
                 wait_for_input(period)
                 continue
