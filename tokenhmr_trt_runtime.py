@@ -36,10 +36,13 @@ class TokenHMRTensorRT:
             dtype = dtype_map[self.engine.get_tensor_dtype(name)]
             self.outputs[name] = torch.empty(shape, device="cuda", dtype=dtype)
             self.context.set_tensor_address(name, self.outputs[name].data_ptr())
-        # Pose is latency-sensitive while the BEV furniture detector is a
-        # throughput/background task. Use CUDA's greatest-priority stream so
-        # queued BEV kernels cannot add hundreds of milliseconds before a pose
-        # inference. Stream priority changes scheduling only, never numerics.
+        # Pose is latency-sensitive and shares this GPU with the segmentation
+        # engine, which is a throughput task.  Use CUDA's greatest-priority
+        # stream so queued segmentation kernels cannot add hundreds of
+        # milliseconds in front of a pose inference.  Stream priority changes
+        # scheduling only, never numerics.  (This originally named the BEV
+        # furniture detector as the competing load; that detector is gone, the
+        # contention is not.)
         try:
             # CUDA/PyTorch convention: negative values request higher
             # priority. Older PyTorch builds expose Stream(priority=...) but
