@@ -24,10 +24,15 @@ import torch
 class YoloSegTRT:
     """Person box + full-resolution bool mask, computed entirely on the GPU."""
 
-    def __init__(self, path, conf=0.4, person_class=0, device="cuda"):
+    def __init__(self, path, conf=0.4, person_class=0, device="cuda",
+                 classes=None):
         import tensorrt as trt
         self.conf = float(conf)
         self.person_class = int(person_class)
+        # None means "every class the engine knows".  detect_all() uses this;
+        # __call__ keeps its own single-class filter so the pose demos are
+        # unchanged.
+        self.classes = None if classes is None else sorted(int(c) for c in classes)
         self.device = torch.device(device)
         blob = self._strip_ultralytics_header(Path(path).read_bytes())
         self.logger = trt.Logger(trt.Logger.WARNING)
@@ -146,6 +151,84 @@ class YoloSegTRT:
             conf = float(det[i, 4].item())
             out.append((box_src.cpu().numpy(), mask.cpu().numpy(), conf))
         return out
+
+    def detect_all(self, rgb):
+        """Every allowed detection: (box_xyxy, mask HxW bool, conf, class id).
+
+        The segmenter needs furniture as well as people, so unlike __call__
+        this keeps the class id and does not reduce to one winner.  Every row
+        is decoded in ONE batch: the per-detection loop __call__ uses is fine
+        for the one or two people the pose demos look at, but this frame
+        carries about fourteen instances, and fourteen separate full-resolution
+        interpolations cost more than the ultralytics wrapper this is meant to
+        beat.
+        """
+        h, w = rgb.shape[:2]
+        r, new_h, new_w, pad_t, pad_l = self._letterbox_params(h, w)
+        self._infer(rgb, new_h, new_w, pad_t, pad_l)
+
+        det = self.outputs[self.det_name][0]          # (N, 38)
+        protos = self.outputs[self.proto_name][0]     # (32, ph, pw)
+
+        cls = det[:, 5].round()
+        keep = det[:, 4] >= self.conf
+        if self.classes is not None:
+            allowed = torch.tensor(self.classes, device=det.device,
+                                   dtype=cls.dtype)
+            keep &= (cls.unsqueeze(1) == allowed).any(1)
+        idx = torch.nonzero(keep).flatten()
+        if not len(idx):
+            return []
+
+        rows = det.index_select(0, idx)               # (K, 38)
+        coeffs = rows[:, 6:].float()                  # (K, 32)
+        ph, pw = protos.shape[-2:]
+        masks = torch.sigmoid(
+            coeffs @ protos.float().reshape(protos.shape[0], -1)
+        ).reshape(-1, ph, pw)                         # (K, ph, pw)
+
+        sy, sx = ph / self.net_h, pw / self.net_w
+        y0, y1 = int(pad_t * sy), int(round((pad_t + new_h) * sy))
+        x0, x1 = int(pad_l * sx), int(round((pad_l + new_w) * sx))
+        crop = masks[:, y0:max(y1, y0 + 1), x0:max(x1, x0 + 1)].unsqueeze(1)
+        full = torch.nn.functional.interpolate(
+            crop, size=(h, w), mode="bilinear", align_corners=False)[:, 0]
+
+        b = rows[:, :4]
+        boxes = torch.stack([(b[:, 0] - pad_l) / r, (b[:, 1] - pad_t) / r,
+                             (b[:, 2] - pad_l) / r, (b[:, 3] - pad_t) / r], 1)
+        boxes[:, 0].clamp_(0, w - 1); boxes[:, 2].clamp_(0, w - 1)
+        boxes[:, 1].clamp_(0, h - 1); boxes[:, 3].clamp_(0, h - 1)
+
+        ys = torch.arange(h, device=self.device).view(1, h, 1)
+        xs = torch.arange(w, device=self.device).view(1, 1, w)
+        bx = boxes.view(-1, 4, 1, 1)
+        inside = ((xs >= bx[:, 0]) & (xs <= bx[:, 2]) &
+                  (ys >= bx[:, 1]) & (ys <= bx[:, 3]))
+        out_masks = (full > 0.5) & inside
+
+        # One transfer for the small tensors, one for the masks.
+        meta = torch.cat([boxes, rows[:, 4:5].float(),
+                          cls.index_select(0, idx).unsqueeze(1).float()], 1).cpu().numpy()
+        mnp = out_masks.cpu().numpy()
+        return [(meta[i, :4], mnp[i], float(meta[i, 4]), int(meta[i, 5]))
+                for i in range(len(idx))]
+
+    def _infer(self, rgb, new_h, new_w, pad_t, pad_l):
+        """Letterbox on the GPU and run the engine."""
+        src = torch.from_numpy(np.ascontiguousarray(rgb)).to(
+            self.device, non_blocking=True)
+        chw = src.permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+        resized = torch.nn.functional.interpolate(
+            chw, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        self.in_buf.zero_()
+        self.in_buf[..., pad_t:pad_t + new_h, pad_l:pad_l + new_w] = resized.to(
+            self.in_buf.dtype)
+        caller = torch.cuda.current_stream()
+        self.stream.wait_stream(caller)
+        if not self.context.execute_async_v3(stream_handle=self.stream.cuda_stream):
+            raise RuntimeError("YOLO TensorRT execution failed")
+        caller.wait_stream(self.stream)
 
     def _decode(self, det, protos, row_idx, h, w, r, pad_t, pad_l, new_h, new_w):
         """One detection row -> (box in source pixels, full-res bool mask)."""

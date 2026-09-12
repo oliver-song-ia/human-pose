@@ -106,13 +106,22 @@ def load_full_model(device):
         if not ckpt.exists():
             raise FileNotFoundError(
                 f"TokenHMR checkpoint missing: {TOKENHMR_ROOT / CHECKPOINT}")
+        import inspect
         from tokenhmr.lib.models import load_tokenhmr
         # init_renderer=False keeps pyrender/EGL out of this: the export needs
         # no visualisation and a headless box may have no GL context at all.
-        model, cfg = load_tokenhmr(checkpoint_path=str(ckpt),
-                                   model_cfg=MODEL_CONFIG,
-                                   is_train_state=False, is_demo=True,
-                                   init_renderer=False)
+        # Upstream TokenHMR has no such argument -- it always builds the
+        # renderer -- and passing it there is a TypeError, so ask first.  A
+        # checkout that does not have it still exports; it just has to be able
+        # to import pyrender, which is why that is in the dependency list.
+        kw = dict(checkpoint_path=str(ckpt), model_cfg=MODEL_CONFIG,
+                  is_train_state=False, is_demo=True)
+        if "init_renderer" in inspect.signature(load_tokenhmr).parameters:
+            kw["init_renderer"] = False
+        else:
+            print("TokenHMR: this checkout has no init_renderer; the renderer "
+                  "will be built (needs pyrender and a GL context)", flush=True)
+        model, cfg = load_tokenhmr(**kw)
     finally:
         os.chdir(old_cwd)
     return model.to(device).eval(), cfg
