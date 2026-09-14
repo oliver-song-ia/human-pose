@@ -67,22 +67,31 @@ SIGMA_DEFAULT = 0.020
 BETAS_SMOOTHING = True
 BETAS_ALPHA = 0.05           # weight of the newest frame once warmed up
 BETAS_WARM = 20              # frames of plain averaging before the EMA takes over
-BETAS_STATE = {"mean": None, "n": 0}
+# Keyed, because more than one person goes through run_tokenhmr.  One global
+# running mean was fine for this file -- it fits the single person a viewer
+# picked -- but pose_from_tracker sends the target AND every bystander through
+# the same call, so their shapes were all folded into one estimate and the
+# target's proportions drifted toward the average of the room.  A caller that
+# has an identity passes it as betas_key; None keeps the old single slot.
+BETAS_STATE = {}
 
 
-def reset_betas_state():
-    BETAS_STATE["mean"] = None
-    BETAS_STATE["n"] = 0
+def reset_betas_state(key=None):
+    """Forget a shape estimate.  No key clears every one of them."""
+    if key is None:
+        BETAS_STATE.clear()
+    else:
+        BETAS_STATE.pop(key, None)
 
 
-def smooth_betas(betas):
-    """Running mean -> EMA on the shape coefficients."""
+def smooth_betas(betas, key=None):
+    """Running mean -> EMA on the shape coefficients, per person."""
     if not BETAS_SMOOTHING:
         return betas
-    st = BETAS_STATE
-    if st["mean"] is None:
-        st["mean"] = betas.clone()
-        st["n"] = 1
+    st = BETAS_STATE.get(key)
+    if st is None:
+        st = {"mean": betas.clone(), "n": 1}
+        BETAS_STATE[key] = st
     elif st["n"] < BETAS_WARM:
         st["n"] += 1
         st["mean"] += (betas - st["mean"]) / st["n"]
@@ -186,7 +195,8 @@ def load_tokenhmr_engine(device):
             "focal": float(cfg.EXTRA.FOCAL_LENGTH)}, None, faces
 
 
-def run_tokenhmr(eng, tf, rgb, bbox_xyxy, device, is_bgr=False):
+def run_tokenhmr(eng, tf, rgb, bbox_xyxy, device, is_bgr=False,
+                 betas_key=None):
     from tokenhmr.lib.datasets.vitdet_dataset import ViTDetDataset
     t0 = time.perf_counter()
     # Dataset follows OpenCV convention; the shared pipeline supplies RGB.
@@ -216,7 +226,7 @@ def run_tokenhmr(eng, tf, rgb, bbox_xyxy, device, is_bgr=False):
             smpl_out = eng["model"].smpl(
                 global_orient=global_orient.float(),
                 body_pose=body_pose.float(),
-                betas=smooth_betas(betas.float()),
+                betas=smooth_betas(betas.float(), betas_key),
                 pose2rot=False)
             verts_t = smpl_out.vertices
             joints44_t = smpl_out.joints
@@ -252,20 +262,25 @@ def run_tokenhmr(eng, tf, rgb, bbox_xyxy, device, is_bgr=False):
     # assumes.  Fast SAM gets an equivalent quantity for free -- its worker runs
     # with the real intrinsics and returns pred_cam_t in the camera frame --
     # which is why its placement is markedly better.
+    cam_state = None
     if eng["trt"] is not None:
-        PIPE.MODEL_CAM_T = {
+        cam_state = {
             "cam_t": cam_t[0].float().cpu().numpy(),
             "box_center": np.asarray(item["box_center"], np.float32),
             "box_size": float(item["box_size"]),
             "crop_px": float(eng["cfg"].MODEL.IMAGE_SIZE),
             "crop_focal": float(eng["focal"]),
         }
-    else:
-        PIPE.MODEL_CAM_T = None
+    # A module global, so this is single-caller by construction: the target's
+    # root blending reads it immediately after the fit that set it.  A second
+    # thread fitting bystanders would have to be given its own slot -- see the
+    # note in the loop about why there is no such thread.
+    PIPE.MODEL_CAM_T = cam_state
     t4 = time.perf_counter()
-    PIPE.MODEL_PROFILE = {"model_pre": (t1-t0)*1e3, "model_pre_crop": (t0b-t0)*1e3,
-                        "model_pre_h2d": (t1-t0b)*1e3, "model_gpu": (t3-t2)*1e3,
-                        "model_post": (t4-t3)*1e3}
+    _profile = {"model_pre": (t1-t0)*1e3, "model_pre_crop": (t0b-t0)*1e3,
+                "model_pre_h2d": (t1-t0b)*1e3, "model_gpu": (t3-t2)*1e3,
+                "model_post": (t4-t3)*1e3}
+    PIPE.MODEL_PROFILE = _profile
     return verts.astype(np.float32), joints, pelvis_px.astype(np.float32), sigma
 
 

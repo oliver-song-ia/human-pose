@@ -665,6 +665,48 @@ def main():
 
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
 
+    # ---- the z-shift, measured off the skeleton's path -------------------
+    # See place_target for why one frame of staleness is affordable here and
+    # what it buys.  The worker owns the fit-cloud publish too: that picture
+    # is of the cloud IT built, so sending it from here keeps the two together
+    # and takes another 0.7 ms off the loop.
+    refine_lock = threading.Lock()
+    refine_wake = threading.Event()
+    refine_job = [None]
+    refine_dz = [0.0]
+    refine_async = os.environ.get("POSE_REFINE_ASYNC", "1") == "1"
+
+    def refine_loop():
+        while True:
+            refine_wake.wait()
+            with refine_lock:
+                job = refine_job[0]
+                refine_job[0] = None
+                refine_wake.clear()
+            if job is None:
+                continue
+            v, depth_j, mask_j, K_j, w_j, vis_j, frame_j, stamp_j = job
+            try:
+                cloud = PIPE.person_cloud(depth_j, mask_j, K_j)
+                publish_fit_cloud(cloud, frame_j, stamp_j)
+                PIPE.refine_to_cloud(v, v[:1].copy(), cloud, w_j,
+                                     visible_idx=vis_j)
+                lr = PIPE.LAST_REFINE
+                # refine_to_cloud records dz even on the frames it refuses to
+                # apply it -- too few correspondences, or a shift over the cap
+                # -- and returns the mesh untouched.  Borrowing a number it
+                # rejected would apply exactly the shift it just decided was
+                # wrong, so a refusal carries forward as no shift, which is
+                # what the synchronous path did on that frame too.
+                refine_dz[0] = (float(lr["dz"]) if lr["why"] == "ok"
+                                and abs(float(lr["dz"])) <= 0.4 else 0.0)
+            except Exception as exc:                   # pragma: no cover
+                print(f"refine failed: {exc}", flush=True)
+
+    if refine_async:
+        threading.Thread(target=refine_loop, daemon=True).start()
+
+
     # Filled in from the first body fitted; the pose only orders the
     # collapses, it cannot change what is legal to collapse.
     tri = [None]
@@ -707,20 +749,28 @@ def main():
         return m
 
     def publish_bodies(bodies, header):
-        """Everyone's raw joints, one cloud, w = the instance id.
+        """Everyone's raw joints, one cloud, w = the TRACK id.
 
         This is the machine-readable output the gesture policy reads; it is
         published whether or not anybody is designated, because deciding who
         matters is somebody else's job.
+
+        It used to carry the instance id, and the reader mapped it to a track
+        through the tracks message for the same stamp.  That only works while
+        every body in the cloud came from that stamp -- which stopped being
+        true when the bystanders moved to their own thread, and would have
+        credited one person's raised hand to whoever held their instance number
+        this frame.  Instance numbers are frame-local; sending the track id
+        keeps them inside this node, where they are still meaningful.
         """
         import array
         from sensor_msgs.msg import PointCloud2, PointField
         data = np.zeros((len(bodies) * BODY_POINTS, 4), np.float32)
-        for k, (inst_id, joints, crown) in enumerate(bodies):
+        for k, (track_id, joints, crown) in enumerate(bodies):
             lo = k * BODY_POINTS
             data[lo:lo + JOINTS_PER_BODY, :3] = joints[:JOINTS_PER_BODY]
             data[lo + JOINTS_PER_BODY, :3] = crown
-            data[lo:lo + BODY_POINTS, 3] = float(inst_id)
+            data[lo:lo + BODY_POINTS, 3] = float(track_id)
         msg = PointCloud2()
         msg.header.stamp = header.stamp
         msg.header.frame_id = st["cam_frame"] or ""
@@ -850,12 +900,11 @@ def main():
         root_stab.reset()
         root_smooth.reset()
         facing_smooth.reset()
-        ML.reset_betas_state()
 
     def instance_of(det):
         return int(det.id) if str(det.id).isdigit() else 0
 
-    def fit_one(det, labels, rgb, depth_m, fy):
+    def fit_one(det, labels, rgb, depth_m, fy, betas_key=None):
         """TokenHMR for one detection, and how much of them was in view.
 
         Returns (visible, fit).  `visible` is the more limiting of the two
@@ -882,7 +931,7 @@ def main():
                 or height < args.min_visible_height):
             return visible, None
         verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
-            eng, tf_model, rgb, box, device)
+            eng, tf_model, rgb, box, device, betas_key=betas_key)
         # Now that there is a body, ask the question properly.  The gate above
         # had to use a standing person because there was nothing else to go on;
         # this one knows how long the person actually is in the pose they are
@@ -931,6 +980,7 @@ def main():
             prof["ground"] += (time.monotonic() - t_stage) * 1e3
             return None
         verts_m, joints_m = PIPE.ground(verts, joints, root)
+        verts_m_fresh = verts_m
         t_sub = time.monotonic()
         # Hidden-point removal, and it is the expensive half of grounding.  The
         # z-buffer alternative in live_pipeline (FAST_VISIBILITY) costs 0.2 ms
@@ -952,15 +1002,50 @@ def main():
             verts_m, K, mask, depth_m,
             candidate_idx=np.arange(0, len(verts_m), VIS_STRIDE))
         prof["g_vis"] += (time.monotonic() - t_sub) * 1e3
+
+        # The registration's whole output is one number: a z-shift.  Rotation
+        # and lateral are deliberately excluded (see refine_to_cloud), so
+        # "align the mesh to the cloud" is "move it dz along z".
+        #
+        # Building the cloud and finding that number is 15.7 ms of the
+        # skeleton's own path, and the number barely moves between frames:
+        # measured on an Orin, |dz(n) - dz(n-1)| is p50 0.42, p90 1.19, max
+        # 3.40 cm against a correction that is itself 3-8 cm, which is inside
+        # the depth sensor's noise.  So this frame is shifted by the number the
+        # last one measured, and the measurement for the next frame is handed
+        # to a thread.  The mesh is re-grounded from this frame's depth every
+        # time, so the person's position is never stale -- only the residual
+        # alignment is, by one frame.
+        #
+        # A thread here is not the thread that failed for the bystanders:
+        # that one was TokenHMR competing for the GPU.  person_cloud and
+        # refine_to_cloud are numpy and a scipy KD-tree, which release the GIL.
+        # POSE_REFINE_ASYNC=0 puts it back in line.
         t_sub = time.monotonic()
-        t_sub = time.monotonic()
-        fit_cloud = PIPE.person_cloud(depth_m, mask, K)
-        prof["cloud"] += (time.monotonic() - t_sub) * 1e3
-        publish_fit_cloud(fit_cloud, st["cam_frame"] or args.world_frame, stamp)
-        verts_m, joints_m = PIPE.refine_to_cloud(
-            verts_m, joints_m, fit_cloud,
-            PIPE.vertex_fit_weights(sigma), visible_idx=vis_idx)
-        prof["g_refine"] += (time.monotonic() - t_sub) * 1e3
+        if refine_async:
+            dz = refine_dz[0]
+            if dz:
+                verts_m = verts_m.copy(); joints_m = joints_m.copy()
+                verts_m[:, 2] += dz
+                joints_m[:, 2] += dz
+            with refine_lock:
+                refine_job[0] = (verts_m_fresh, depth_m, mask, K,
+                                 PIPE.vertex_fit_weights(sigma), vis_idx,
+                                 st["cam_frame"] or args.world_frame, stamp)
+            refine_wake.set()
+            prof["g_refine"] += (time.monotonic() - t_sub) * 1e3
+        else:
+            fit_cloud = PIPE.person_cloud(depth_m, mask, K)
+            prof["cloud"] += (time.monotonic() - t_sub) * 1e3
+            t_sub = time.monotonic()
+            publish_fit_cloud(fit_cloud, st["cam_frame"] or args.world_frame,
+                              stamp)
+            prof["fitcloud"] += (time.monotonic() - t_sub) * 1e3
+            t_sub = time.monotonic()
+            verts_m, joints_m = PIPE.refine_to_cloud(
+                verts_m, joints_m, fit_cloud,
+                PIPE.vertex_fit_weights(sigma), visible_idx=vis_idx)
+            prof["g_refine"] += (time.monotonic() - t_sub) * 1e3
         lr, lroot = PIPE.LAST_REFINE, PIPE.LAST_ROOT
         fit_why[lr["why"]] += 1
         fit_dz.append(abs(lr["dz"]))
@@ -1091,8 +1176,7 @@ def main():
             """
             return track * 2 + (1 if second else 0)
 
-        for inst, visible, fit in people:
-            track = track_of.get(inst)
+        for track, visible, fit in people:
             # No track id: either the tracks message for this stamp never
             # arrived -- measured at 13% of frames on an Orin -- or BoT-SORT
             # did not associate this detection.  There used to be a fallback
@@ -1105,7 +1189,8 @@ def main():
             # frame that resolves them puts them back where they were.
             if track is None:
                 continue
-            is_target = target_instance is not None and inst == target_instance
+            is_target = (target_instance is not None
+                         and track == track_of.get(target_instance))
             # The target's own skeleton is already drawn, in its own colour,
             # from a better fit; here it only needs its label.
             colour = (ColorRGBA(r=0.95, g=0.95, b=0.35, a=1.0) if is_target
@@ -1219,7 +1304,7 @@ def main():
     # three things inside it, listed separately because each was a suspect at
     # some point and the split is what settled it.
     PROF_KEYS = ("decode", "fit", "ground", "mesh", "markers", "others",
-                 "joints", "people", "g_vis", "cloud", "g_refine")
+                 "joints", "people", "g_vis", "cloud", "fitcloud", "g_refine")
 
     def new_prof():
         p = {k: 0.0 for k in PROF_KEYS}
@@ -1328,7 +1413,11 @@ def main():
                 root_stab.reset()
                 root_smooth.reset()
                 facing_smooth.reset()
-                ML.reset_betas_state()
+                # Only the person we are leaving.  Shape estimates are keyed by
+                # track now, so everybody else's is still about them and still
+                # converged -- clearing the lot made the new target start from
+                # a cold estimate that the room had to re-warm.
+                ML.reset_betas_state(last_target[0])
             elif st["target"] != last_target[0]:
                 node.get_logger().info(
                     f"target #{last_target[0]} -> #{st['target']}: same person, "
@@ -1349,10 +1438,11 @@ def main():
             bodies = []
             fy = float(K[1, 1]) if K is not None else 0.0
             people = []                      # (instance, visible, fit or None)
-            vis, got = (fit_one(target_det, labels, rgb, depth_m, fy)
+            vis, got = (fit_one(target_det, labels, rgb, depth_m, fy,
+                                betas_key=track_of.get(instance_of(target_det)))
                         if target_det else (0.0, None))
             if target_det is not None:
-                people.append((instance_of(target_det), vis, got))
+                people.append((track_of.get(instance_of(target_det)), vis, got))
             prof["fit"] += (time.monotonic() - t_stage) * 1e3
             placed = None
             if got is None:
@@ -1363,7 +1453,9 @@ def main():
                 idles += 1
                 go_idle()
             else:
-                bodies.append((got[0], got[1], crown_of(got[2], got[1])))
+                t_id = track_of.get(instance_of(target_det))
+                if t_id is not None:
+                    bodies.append((t_id, got[1], crown_of(got[2], got[1])))
 
             # ---- the person being followed, first of all --------------------
             # Their skeleton is what downstream acts on and what a viewer is
@@ -1382,12 +1474,20 @@ def main():
             # ---- everybody else, for the gesture policy ----------------------
             # Raw joints are all a raised hand needs -- it is a comparison
             # inside one body -- and the policy debounces over frames anyway,
-            # so these do not have to keep up with the camera while somebody
-            # is designated.  With nobody designated there is no target
-            # latency to protect and everyone is a candidate, so the rate
-            # limit lifts: otherwise /pose/joints would go empty on the frames
-            # in between, and the policy would be reading a room that keeps
-            # emptying out.
+            # so these do not have to keep up with the camera.
+            #
+            # On this loop, and a thread was tried.  One TokenHMR per
+            # bystander is ~25 ms of loop that the NEXT frame waits behind, so
+            # moving them to a worker with its own execution context looked
+            # free.  Measured back to back on an Orin, same two people standing
+            # in the same places: the loop's `others` went 24.9 -> 0.0 ms and
+            # the skeleton went 148.4 -> 154.9 ms.  It is slower.  The work did
+            # not leave, it changed threads: the worker's TokenHMR contends for
+            # the same GPU, so the target's own `fit` rose 45.3 -> 51.4 ms and
+            # ate the saving twice over.  The bottleneck here is the GPU, and a
+            # second thread does not make a second GPU.  (Same mechanism as the
+            # mesh-drawing thread in publish_mesh, for a different reason: that
+            # one lost to the GIL, this one to the device.)
             t_stage = time.monotonic()
             others_fresh = (target_det is None
                             or loop_t0 - last_others_t[0]
@@ -1397,11 +1497,15 @@ def main():
                 for det in crowd:
                     if det is target_det:
                         continue
-                    vis, other = fit_one(det, labels, rgb, depth_m, fy)
-                    people.append((instance_of(det), vis, other))
+                    tid = track_of.get(instance_of(det))
+                    if tid is None:
+                        continue
+                    vis, other = fit_one(det, labels, rgb, depth_m, fy,
+                                         betas_key=tid)
+                    people.append((tid, vis, other))
                     if other is not None:
                         bodies.append(
-                            (other[0], other[1], crown_of(other[2], other[1])))
+                            (tid, other[1], crown_of(other[2], other[1])))
             prof["others"] += (time.monotonic() - t_stage) * 1e3
 
             # ---- everybody's joints, for the gesture policy ------------------
