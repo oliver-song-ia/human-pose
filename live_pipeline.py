@@ -599,7 +599,8 @@ def _weighted_median(x, w):
     return float(x[np.searchsorted(c, 0.5 * c[-1])])
 
 
-def person_cloud(depth_m, mask, K, stride=6, target_points=None):
+def person_cloud(depth_m, mask, K, stride=6, target_points=None,
+                 return_uv=False):
     """Observed person-surface points (metric camera frame) for the ICP refine.
 
     Only the front surface of one person should reach the registration, so
@@ -624,8 +625,14 @@ def person_cloud(depth_m, mask, K, stride=6, target_points=None):
     began running out of correspondences to work with.  It never goes sparser
     than the `stride` asked for.
     """
+    # `return_uv` hands back the pixel each point came from, so a caller that
+    # wants the person in their own colours can sample the colour image at
+    # exactly the points that survived the filtering.  Colour is not this
+    # function's business; where the points are is.
     target_points = (CLOUD_TARGET_POINTS if target_points is None
                      else target_points)
+    empty = (np.zeros((0, 3), np.float64),
+             np.zeros(0, np.int32), np.zeros(0, np.int32))
     m8 = np.ascontiguousarray(mask).astype(np.uint8)
     if CLOUD_ERODE_PX > 0:
         k = 2 * CLOUD_ERODE_PX + 1
@@ -637,7 +644,7 @@ def person_cloud(depth_m, mask, K, stride=6, target_points=None):
             m8 = thin
     area = cv2.countNonZero(m8)
     if area < 20:
-        return np.zeros((0, 3), np.float64)
+        return empty if return_uv else empty[0]
     if target_points:
         stride = (1 if area <= target_points else
                   int(min(stride, max(1, round(np.sqrt(area / target_points))))))
@@ -649,7 +656,7 @@ def person_cloud(depth_m, mask, K, stride=6, target_points=None):
     z = depth_m[ys, xs]
     ok = (z > MINZ) & (z < MAXZ) & (m8[ys, xs] > 0)
     if ok.sum() < 20:
-        return np.zeros((0, 3), np.float64)
+        return empty if return_uv else empty[0]
 
     if CLOUD_SPIKE_M > 0:
         # Each kept sample against the median of its eight grid neighbours.
@@ -678,7 +685,8 @@ def person_cloud(depth_m, mask, K, stride=6, target_points=None):
     ys, xs, z = ys[ok], xs[ok], z[ok]
     x = (xs - K[0, 2]) * z / K[0, 0]
     y = (ys - K[1, 2]) * z / K[1, 1]
-    return np.stack([x, y, z], 1).astype(np.float64)
+    pts = np.stack([x, y, z], 1).astype(np.float64)
+    return (pts, ys, xs) if return_uv else pts
 
 
 def visible_vertices(verts, K=None, mask=None, depth_m=None, candidate_idx=None,

@@ -523,6 +523,20 @@ def main():
                     help="keep the last body on screen for this long when the "
                          "target cannot be fitted; below it a dropped frame "
                          "reads as a departure and the body blinks")
+    ap.add_argument("--people-hold", type=float, default=None,
+                    help="how long a bystander's skeleton and label stay up "
+                         "after the last frame that drew them.  Default is "
+                         "four --others-hz periods, floor 0.6 s.  It has to "
+                         "outlast every reason a person can be missing "
+                         "without having left, and those compound: at "
+                         "--others-hz 3 a bystander gets a chance every 333 "
+                         "ms, and measured on an Orin 10-20%% of those chances "
+                         "are lost to a track that did not associate, an "
+                         "instance mask that did not arrive for that stamp, or "
+                         "a frame where too little of them showed.  Two misses "
+                         "in a row is already a second.  0.6 s was tried as a "
+                         "constant and a standing bystander still blinked "
+                         "every two seconds")
     ap.add_argument("--people-hz", type=float, default=10.0,
                     help="how often ~/people is redrawn; it is a picture and "
                          "is skipped entirely when nothing subscribes to it")
@@ -685,10 +699,14 @@ def main():
                 refine_wake.clear()
             if job is None:
                 continue
-            v, depth_j, mask_j, K_j, w_j, vis_j, frame_j, stamp_j = job
+            (v, depth_j, mask_j, K_j, w_j, vis_j, frame_j, stamp_j,
+             rgb_j) = job
             try:
-                cloud = PIPE.person_cloud(depth_j, mask_j, K_j)
-                publish_fit_cloud(cloud, frame_j, stamp_j)
+                cloud, cy, cx = PIPE.person_cloud(depth_j, mask_j, K_j,
+                                                  return_uv=True)
+                publish_fit_cloud(
+                    cloud, rgb_j[cy, cx] if rgb_j is not None else None,
+                    frame_j, stamp_j)
                 PIPE.refine_to_cloud(v, v[:1].copy(), cloud, w_j,
                                      visible_idx=vis_j)
                 lr = PIPE.LAST_REFINE
@@ -712,6 +730,8 @@ def main():
     tri = [None]
     bones = np.asarray(PIPE.SMPL_BONES, np.int32).reshape(-1)
     VIS_STRIDE = max(1, int(args.vis_stride))
+    if args.people_hold is None:
+        args.people_hold = max(0.6, 4.0 / max(args.others_hz, 0.1))
     root_stab = PIPE.RootStabiliser(args.root_max_speed, args.root_grace)
     # After the outlier rejection, not instead of it: one stops the body
     # teleporting, the other stops it trembling while its owner sits still.
@@ -723,6 +743,7 @@ def main():
     last_drawn = [0.0]
     last_people_t = [0.0]
     people_shown = [set()]        # marker ids currently up in the "people" ns
+    people_seen = {}              # marker id -> when it was last drawn
     reset_sent = [False]          # whether a previous run's markers were wiped
     last_target = [None]
     last_epoch = [None]
@@ -788,24 +809,40 @@ def main():
         msg.data = array.array("B", data.tobytes())
         pub_bodies.publish(msg)
 
-    def publish_fit_cloud(cloud, frame, stamp):
-        """What refine_to_cloud was given, as XYZ, for a viewer to check."""
+    def publish_fit_cloud(cloud, colours, frame, stamp):
+        """What refine_to_cloud was given, in the person's own colours.
+
+        It used to go out as bare XYZ and RViz painted it one flat colour, so
+        the only thing a viewer could read off it was the silhouette.  The
+        points come from known pixels -- person_cloud hands them back -- so
+        sampling the colour image at those pixels costs a gather and makes the
+        cloud show which part of the person each point is.
+        """
         if pub_fit_cloud.get_subscription_count() == 0 or not len(cloud):
             return
         import array
         from sensor_msgs.msg import PointField
         pts = np.asarray(cloud, np.float32)
+        # x y z then rgb packed into one float32, which is the layout RViz's
+        # RGB8 transformer expects.
+        buf = np.zeros((len(pts), 4), np.float32)
+        buf[:, :3] = pts
+        if colours is not None and len(colours) == len(pts):
+            c = np.asarray(colours, np.uint32)
+            packed = (c[:, 0] << 16) | (c[:, 1] << 8) | c[:, 2]
+            buf[:, 3] = packed.astype(np.uint32).view(np.float32)
         msg = PointCloud2()
         msg.header.frame_id, msg.header.stamp = frame, stamp
         msg.height, msg.width = 1, len(pts)
         msg.is_dense, msg.is_bigendian = True, False
-        msg.point_step, msg.row_step = 12, 12 * len(pts)
+        msg.point_step, msg.row_step = 16, 16 * len(pts)
         msg.fields = [
             PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
             PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
             PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="rgb", offset=12, datatype=PointField.FLOAT32, count=1),
         ]
-        msg.data = array.array("B", pts.tobytes())
+        msg.data = array.array("B", buf.tobytes())
         pub_fit_cloud.publish(msg)
 
     def to_points(a):
@@ -843,6 +880,35 @@ def main():
             arr.markers.append(m)
         pub_people.publish(arr)
         people_shown[0] = set()
+        people_seen.clear()
+
+    def expire_people():
+        """Take down only the people whose hold has run out.
+
+        The idle path used to call clear_people(), which wipes everybody the
+        moment one frame has no humans in it -- or no instance mask for its
+        stamp, which is not the same claim at all: a mask that did not arrive
+        says nothing about who is in the room.  One such frame deleted every
+        marker and the next put them all back, which is the bystander blink
+        --people-hold was supposed to have ended.  The hold lives in
+        publish_people and this path never reaches it, so it is applied here
+        too.
+        """
+        now_s = time.monotonic()
+        gone = [mid for mid, t in people_seen.items()
+                if now_s - t > args.people_hold]
+        if not gone:
+            return
+        arr = MarkerArray()
+        for mid in gone:
+            del people_seen[mid]
+            m = Marker()
+            m.header.frame_id = st["cam_frame"] or args.world_frame
+            m.header.stamp = node.get_clock().now().to_msg()
+            m.ns, m.id, m.action = "people", mid, Marker.DELETE
+            arr.markers.append(m)
+        pub_people.publish(arr)
+        people_shown[0] = set(people_seen)
 
     def reset_stale_markers():
         """Wipe whatever a previous run of this node left on screen.
@@ -874,6 +940,7 @@ def main():
         arr.markers.append(wipe("people"))
         pub_people.publish(arr)
         people_shown[0] = set()
+        people_seen.clear()
         shown[0] = False
         reset_sent[0] = True
         node.get_logger().info(
@@ -901,6 +968,8 @@ def main():
         root_smooth.reset()
         facing_smooth.reset()
 
+    last_gate = ["never ran"]
+
     def instance_of(det):
         return int(det.id) if str(det.id).isdigit() else 0
 
@@ -927,9 +996,21 @@ def main():
         fill = visible_fraction(px, area)
         height = visible_height_fraction(mask, depth_m, fy)
         visible = min(fill, height)
-        if (px < args.min_mask_px or fill < 1.0 - args.max_occlusion
-                or height < args.min_visible_height):
+        # Which gate, not just that one of them closed.  A bystander whose
+        # skeleton comes and goes is one of these firing intermittently, and
+        # they call for different answers: a mask that keeps dropping under
+        # min_mask_px is a segmentation problem, a height that hovers at
+        # min_visible_height is a threshold sitting in the wrong place.
+        if px < args.min_mask_px:
+            last_gate[0] = "mask under --min-mask-px"
             return visible, None
+        if fill < 1.0 - args.max_occlusion:
+            last_gate[0] = "over --max-occlusion"
+            return visible, None
+        if height < args.min_visible_height:
+            last_gate[0] = "under --min-visible-height"
+            return visible, None
+        last_gate[0] = "ok"
         verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
             eng, tf_model, rgb, box, device, betas_key=betas_key)
         # Now that there is a body, ask the question properly.  The gate above
@@ -944,7 +1025,7 @@ def main():
                          np.asarray(verts, np.float32), verts, joints,
                          pelvis_px, sigma, mask)
 
-    def place_target(got, depth_m, K, stamp, prof):
+    def place_target(got, depth_m, K, stamp, prof, rgb_for_cloud=None):
         """Stand the target's body on the floor, refine it, and publish it.
 
         Everything in here is for the one designated person: it costs more
@@ -1031,15 +1112,19 @@ def main():
             with refine_lock:
                 refine_job[0] = (verts_m_fresh, depth_m, mask, K,
                                  PIPE.vertex_fit_weights(sigma), vis_idx,
-                                 st["cam_frame"] or args.world_frame, stamp)
+                                 st["cam_frame"] or args.world_frame, stamp,
+                                 rgb_for_cloud)
             refine_wake.set()
             prof["g_refine"] += (time.monotonic() - t_sub) * 1e3
         else:
-            fit_cloud = PIPE.person_cloud(depth_m, mask, K)
+            fit_cloud, cy, cx = PIPE.person_cloud(depth_m, mask, K,
+                                                   return_uv=True)
             prof["cloud"] += (time.monotonic() - t_sub) * 1e3
             t_sub = time.monotonic()
-            publish_fit_cloud(fit_cloud, st["cam_frame"] or args.world_frame,
-                              stamp)
+            publish_fit_cloud(
+                fit_cloud,
+                rgb_for_cloud[cy, cx] if rgb_for_cloud is not None else None,
+                st["cam_frame"] or args.world_frame, stamp)
             prof["fitcloud"] += (time.monotonic() - t_sub) * 1e3
             t_sub = time.monotonic()
             verts_m, joints_m = PIPE.refine_to_cloud(
@@ -1218,7 +1303,14 @@ def main():
                          (0.0, 0.0, args.label_size), colour)
             txt.ns = "people"
             drawn.add(txt.id)
-            txt.text = f"#{track}  {visible * 100:.0f}%"
+            # The track number was here and meant nothing to anybody
+            # watching: it is bookkeeping between two nodes, it changes when
+            # somebody walks out and comes back, and it crowded out the one
+            # figure that answers a viewer's actual question -- why is there no
+            # body on that person.  Only the target is worth naming, and only
+            # as the target.
+            txt.text = (f"TRACKED  {visible * 100:.0f}%" if is_target
+                        else f"{visible * 100:.0f}%")
             # Y is down in the optical frame, so up is -y: the label floats
             # above the head rather than inside it.
             txt.pose.position.x = float(anchor[0])
@@ -1226,32 +1318,39 @@ def main():
             txt.pose.position.z = float(anchor[2])
             arr.markers.append(txt)
 
-        # Only what actually left is deleted.  Wiping the namespace and
-        # redrawing it at --people-hz meant every person's marker was destroyed
-        # and recreated ten times a second; now a person who is still here is
-        # an in-place update, and a DELETE means somebody really has gone.
+        # Only what actually left is deleted, and "left" is a claim about
+        # several frames, not about this one.  A marker missing from `drawn`
+        # can mean four different things and only one of them is "gone":
         #
-        # "Gone" can only be read off a frame that actually looked.  The other
-        # people are fitted at --others-hz, which is allowed to be below
-        # --people-hz, and on the frames in between they are missing from
-        # `drawn` because nobody measured them -- not because they left.
-        # Sweeping then deleted and recreated every bystander at --others-hz:
-        # measured on an Orin at --others-hz 3, one standing bystander got 28
-        # ADDs and 28 DELETEs in 30 s, against 172 ADDs and 13 DELETEs for the
-        # target, who is fitted every frame.  That is the blue skeleton
-        # flickering.  So sweep only on a frame that fitted them, and until
-        # then keep holding what is on screen.
-        # An empty track_of means this frame learned nothing about who is
-        # present, so it cannot be read as "they all left" either.
-        if others_fresh and track_of:
-            for mid in people_shown[0] - drawn:
-                gone_m = Marker()
-                gone_m.header.frame_id, gone_m.header.stamp = frame, stamp
-                gone_m.ns, gone_m.id, gone_m.action = "people", mid, Marker.DELETE
-                arr.markers.append(gone_m)
-            people_shown[0] = drawn
-        else:
-            people_shown[0] |= drawn
+        #   * the bystanders were not fitted this frame, because --others-hz
+        #     is allowed to be below --people-hz;
+        #   * BoT-SORT did not associate them, or their tracks message never
+        #     arrived -- measured on an Orin, one of these happens to a
+        #     standing bystander in 7-20% of frames;
+        #   * they were fitted and the depth could not place them;
+        #   * they walked out.
+        #
+        # Deleting on the first frame a person is missing made their skeleton
+        # blink out roughly every two seconds while they stood still.  Guards
+        # against each individual cause were tried first and are exactly the
+        # wrong shape for this: they multiply, and each one is a fresh chance
+        # to be wrong about a case nobody thought of.  A person who has not
+        # been drawn for --people-hold seconds is gone; until then they are
+        # held where they were last seen.  Somebody who really leaves lingers
+        # for that long, which is the price, and it is a much smaller one than
+        # a skeleton that flickers.
+        now_s = time.monotonic()
+        for mid in drawn:
+            people_seen[mid] = now_s
+        gone = [mid for mid, t in people_seen.items()
+                if now_s - t > args.people_hold]
+        for mid in gone:
+            del people_seen[mid]
+            gone_m = Marker()
+            gone_m.header.frame_id, gone_m.header.stamp = frame, stamp
+            gone_m.ns, gone_m.id, gone_m.action = "people", mid, Marker.DELETE
+            arr.markers.append(gone_m)
+        people_shown[0] = set(people_seen)
         if arr.markers:
             pub_people.publish(arr)
         prof["people"] += (time.monotonic() - t_stage) * 1e3
@@ -1340,9 +1439,11 @@ def main():
             humans = [d for d in inst_msg.detections
                       if d.results and d.results[0].hypothesis.class_id == args.human_class]
             if labels is None or not humans:
+                why["no instance mask for this stamp" if labels is None
+                    else "no humans detected"] += 1
                 idles += 1
                 go_idle()
-                clear_people()
+                expire_people()
                 last_key = key
                 wait_for_input(period)
                 continue
@@ -1465,7 +1566,7 @@ def main():
             # regressed and its skeleton reaching the wire.
             if got is not None:
                 placed = place_target(got, depth_m, K, inst_msg.header.stamp,
-                                      prof)
+                                      prof, rgb_for_cloud=rgb)
                 if placed is not None:
                     fits += 1
                 else:
@@ -1499,9 +1600,12 @@ def main():
                         continue
                     tid = track_of.get(instance_of(det))
                     if tid is None:
+                        why["bystander has no track id"] += 1
                         continue
                     vis, other = fit_one(det, labels, rgb, depth_m, fy,
                                          betas_key=tid)
+                    if other is None:
+                        why[f"bystander {last_gate[0]}"] += 1
                     people.append((tid, vis, other))
                     if other is not None:
                         bodies.append(
