@@ -503,6 +503,12 @@ def main():
     ap.add_argument("--root-smooth-beta", type=float, default=4.0,
                     help="how quickly the smoothing gets out of the way once "
                          "the person does move.  Too low and walking lags")
+    ap.add_argument("--vis-stride", type=int, default=2,
+                    help="take every Nth mesh vertex for the visibility test "
+                         "and the registration that follows it.  1 is every "
+                         "vertex; 2 halves the most expensive stage of "
+                         "grounding for a body that still has 3445 points "
+                         "against a depth cloud of about 2000")
     ap.add_argument("--root-grace", type=int, default=10,
                     help="consecutive outlier frames before a jump is believed "
                          "and the mesh is allowed to teleport there.  The "
@@ -663,6 +669,7 @@ def main():
     # collapses, it cannot change what is legal to collapse.
     tri = [None]
     bones = np.asarray(PIPE.SMPL_BONES, np.int32).reshape(-1)
+    VIS_STRIDE = max(1, int(args.vis_stride))
     root_stab = PIPE.RootStabiliser(args.root_max_speed, args.root_grace)
     # After the outlier rejection, not instead of it: one stops the body
     # teleporting, the other stops it trembling while its owner sits still.
@@ -933,7 +940,17 @@ def main():
         # back-facing vertices where HPR returns 5%.  Coarser cells trade that
         # for throwing away the front surface: 8% back-facing costs 31% of the
         # vertices HPR keeps.  No setting is both.
-        vis_idx = PIPE.visible_vertices(verts_m, K, mask, depth_m)
+        # Every other vertex.  HPR and the KD-tree the registration builds on
+        # its result are the two halves of the grounding stage, and both scale
+        # with this set: on an Orin they were 13.6 and 14.8 ms of a 77 ms
+        # skeleton path.  SMPL's 6890 vertices are far denser than a depth
+        # cloud sampled every few pixels, so half of them still outnumber the
+        # points they are matched against -- the registration is a weighted
+        # median over correspondences, which is exactly the kind of estimate
+        # that loses precision as the square root of the count.
+        vis_idx = PIPE.visible_vertices(
+            verts_m, K, mask, depth_m,
+            candidate_idx=np.arange(0, len(verts_m), VIS_STRIDE))
         prof["g_vis"] += (time.monotonic() - t_sub) * 1e3
         t_sub = time.monotonic()
         t_sub = time.monotonic()
@@ -1025,7 +1042,8 @@ def main():
         return verts_m, out_frame, stamp
 
     def publish_people(people, track_of, target_instance, depth_m, K, stamp,
-                       loop_t0, prof):
+                       loop_t0, prof, target_unresolved=False,
+                       others_fresh=True):
         """Everybody in frame: their skeleton, and how much of them is showing.
 
         The target already gets its own markers, drawn from a body that was
@@ -1042,6 +1060,17 @@ def main():
         """
         if pub_people.get_subscription_count() == 0 or K is None:
             return
+        # Somebody is designated but this frame could not say which detection
+        # they are -- the tracks message for this stamp was missing, or
+        # BoT-SORT returned no row for them.  is_target is then False for
+        # EVERYONE, so the target themselves gets drawn here as a bystander,
+        # in the bystander's colour, while place_target is holding their real
+        # body up in the target's colour.  Measured: 62 times in 45 s a blue
+        # skeleton sat 10-15 cm from the yellow one, both on the same person.
+        # place_target holds through exactly this gap; hold here too rather
+        # than redraw everyone under a guess about who is who.
+        if target_unresolved:
+            return
         if loop_t0 - last_people_t[0] < 1.0 / max(args.people_hz, 0.1):
             return
         t_stage = time.monotonic()
@@ -1050,7 +1079,7 @@ def main():
         arr = MarkerArray()
         drawn = set()
 
-        def mid_of(track, inst, second=False):
+        def mid_of(track, second=False):
             """A marker id that means the same person next frame.
 
             Instance ids are frame-local -- the detector renumbers them
@@ -1058,15 +1087,24 @@ def main():
             skeleton and label change id under RViz for no reason, and forced
             a DELETEALL of the whole namespace every publish to clean up after
             it.  Track ids are the only identity that survives a frame
-            boundary.  Somebody not yet tracked gets a high, clearly separate
-            id off their instance; it is wrong next frame either way, but it
-            cannot collide with a real track.
+            boundary, so they are the only thing keyed on here.
             """
-            base = track * 2 if track is not None else 100000 + inst * 2
-            return base + (1 if second else 0)
+            return track * 2 + (1 if second else 0)
 
         for inst, visible, fit in people:
             track = track_of.get(inst)
+            # No track id: either the tracks message for this stamp never
+            # arrived -- measured at 13% of frames on an Orin -- or BoT-SORT
+            # did not associate this detection.  There used to be a fallback
+            # id built from the instance number, and because instance numbers
+            # are frame-local it was a different id every frame: 29 ADDs and
+            # 28 DELETEs in 30 s for ids that lived one frame each, while the
+            # same people were drawn under their real track ids on the frames
+            # either side.  That is both the bystander flicker and the second
+            # blue skeleton standing beside the first.  Draw nothing; the next
+            # frame that resolves them puts them back where they were.
+            if track is None:
+                continue
             is_target = target_instance is not None and inst == target_instance
             # The target's own skeleton is already drawn, in its own colour,
             # from a better fit; here it only needs its label.
@@ -1082,7 +1120,7 @@ def main():
                     verts_m, joints_m = PIPE.ground(verts, joints, root)
                     anchor = crown_of(verts_m, joints_m)
                     if not is_target:
-                        sk = marker(mid_of(track, inst), Marker.LINE_LIST,
+                        sk = marker(mid_of(track), Marker.LINE_LIST,
                                     frame, stamp, (0.012, 0.0, 0.0), colour)
                         sk.ns = "people"
                         sk.points = to_points(joints_m[bones])
@@ -1090,13 +1128,12 @@ def main():
                         drawn.add(sk.id)
             if anchor is None:
                 continue          # no depth for them: nowhere to put a label
-            txt = marker(mid_of(track, inst, second=True),
+            txt = marker(mid_of(track, second=True),
                          Marker.TEXT_VIEW_FACING, frame, stamp,
                          (0.0, 0.0, args.label_size), colour)
             txt.ns = "people"
             drawn.add(txt.id)
-            name = f"#{track}" if track is not None else f"i{inst}"
-            txt.text = f"{name}  {visible * 100:.0f}%"
+            txt.text = f"#{track}  {visible * 100:.0f}%"
             # Y is down in the optical frame, so up is -y: the label floats
             # above the head rather than inside it.
             txt.pose.position.x = float(anchor[0])
@@ -1108,12 +1145,28 @@ def main():
         # redrawing it at --people-hz meant every person's marker was destroyed
         # and recreated ten times a second; now a person who is still here is
         # an in-place update, and a DELETE means somebody really has gone.
-        for mid in people_shown[0] - drawn:
-            gone_m = Marker()
-            gone_m.header.frame_id, gone_m.header.stamp = frame, stamp
-            gone_m.ns, gone_m.id, gone_m.action = "people", mid, Marker.DELETE
-            arr.markers.append(gone_m)
-        people_shown[0] = drawn
+        #
+        # "Gone" can only be read off a frame that actually looked.  The other
+        # people are fitted at --others-hz, which is allowed to be below
+        # --people-hz, and on the frames in between they are missing from
+        # `drawn` because nobody measured them -- not because they left.
+        # Sweeping then deleted and recreated every bystander at --others-hz:
+        # measured on an Orin at --others-hz 3, one standing bystander got 28
+        # ADDs and 28 DELETEs in 30 s, against 172 ADDs and 13 DELETEs for the
+        # target, who is fitted every frame.  That is the blue skeleton
+        # flickering.  So sweep only on a frame that fitted them, and until
+        # then keep holding what is on screen.
+        # An empty track_of means this frame learned nothing about who is
+        # present, so it cannot be read as "they all left" either.
+        if others_fresh and track_of:
+            for mid in people_shown[0] - drawn:
+                gone_m = Marker()
+                gone_m.header.frame_id, gone_m.header.stamp = frame, stamp
+                gone_m.ns, gone_m.id, gone_m.action = "people", mid, Marker.DELETE
+                arr.markers.append(gone_m)
+            people_shown[0] = drawn
+        else:
+            people_shown[0] |= drawn
         if arr.markers:
             pub_people.publish(arr)
         prof["people"] += (time.monotonic() - t_stage) * 1e3
@@ -1312,6 +1365,20 @@ def main():
             else:
                 bodies.append((got[0], got[1], crown_of(got[2], got[1])))
 
+            # ---- the person being followed, first of all --------------------
+            # Their skeleton is what downstream acts on and what a viewer is
+            # watching, so nothing that cannot change it is allowed in front.
+            # Fitting the OTHER people used to run here, and on an Orin that
+            # is 23 ms of somebody else's TokenHMR between this body being
+            # regressed and its skeleton reaching the wire.
+            if got is not None:
+                placed = place_target(got, depth_m, K, inst_msg.header.stamp,
+                                      prof)
+                if placed is not None:
+                    fits += 1
+                else:
+                    why["depth could not place the target"] += 1
+
             # ---- everybody else, for the gesture policy ----------------------
             # Raw joints are all a raised hand needs -- it is a comparison
             # inside one body -- and the policy debounces over frames anyway,
@@ -1322,8 +1389,10 @@ def main():
             # in between, and the policy would be reading a room that keeps
             # emptying out.
             t_stage = time.monotonic()
-            if (target_det is None
-                    or loop_t0 - last_others_t[0] >= 1.0 / max(args.others_hz, 0.1)):
+            others_fresh = (target_det is None
+                            or loop_t0 - last_others_t[0]
+                            >= 1.0 / max(args.others_hz, 0.1))
+            if others_fresh:
                 last_others_t[0] = loop_t0
                 for det in crowd:
                     if det is target_det:
@@ -1335,33 +1404,25 @@ def main():
                             (other[0], other[1], crown_of(other[2], other[1])))
             prof["others"] += (time.monotonic() - t_stage) * 1e3
 
-            # ---- everybody's joints, before anything is registered ----------
-            # The gesture policy reads these, and a raised hand is a
-            # comparison inside one body: it is answered by the pose the
-            # regressor already returned, and none of the depth registration
-            # below can change the answer.  So it goes out first -- putting
-            # ~14 ms of grounding and refinement in front of the wave decision
-            # bought nothing.
+            # ---- everybody's joints, for the gesture policy ------------------
+            # These used to go out before the target was registered, to keep
+            # the wave decision off the back of the grounding work.  Measured
+            # since: the wave detector decides in 0.07 ms and is never the
+            # constraint, while the target's own skeleton was waiting behind
+            # everyone else's regression.  So the target goes first now and
+            # this follows; the policy debounces over frames and does not
+            # notice the reordering.
             t_stage = time.monotonic()
             publish_bodies(bodies, inst_msg.header)
             prof["joints"] += (time.monotonic() - t_stage) * 1e3
 
-            # ---- and only now, the one person we are following --------------
-            # Standing a body on the floor and registering it onto its own
-            # point cloud is the expensive half, and it is done for the target
-            # alone: nobody else's metric placement is being acted on.
-            if got is not None:
-                placed = place_target(got, depth_m, K, inst_msg.header.stamp,
-                                      prof)
-                if placed is not None:
-                    fits += 1
-                else:
-                    why["depth could not place the target"] += 1
-
             # Last, and only now: the pictures.  Everything a consumer acts
             # on has already gone out.
             publish_people(people, track_of, target_instance, depth_m, K,
-                           inst_msg.header.stamp, loop_t0, prof)
+                           inst_msg.header.stamp, loop_t0, prof,
+                           target_unresolved=(st["target"] >= 0
+                                              and target_instance is None),
+                           others_fresh=others_fresh)
             if placed is not None:
                 publish_mesh(*placed, loop_t0, prof)
 
