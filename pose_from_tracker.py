@@ -133,10 +133,23 @@ PERSON_HEIGHT_M = 1.7
 # because a gesture policy needs it and does not want the 6890-vertex mesh to
 # get it.  The highest vertex of the whole body would be the raised hand.
 JOINTS_PER_BODY = 24
+# The crown and the higher hand tip, both off the mesh rather than the
+# skeleton.  A raised hand clears a head by the distance between the wrist and
+# the fingertips, and the gesture test was comparing the wrist joint against
+# the top of the skull -- the two ends of the body measured differently, which
+# cost about 20 cm of hand and read as "my hand is over my head and it says
+# no".
 CROWN_POINT = 1
-BODY_POINTS = JOINTS_PER_BODY + CROWN_POINT
+HAND_POINT = 1
+BODY_POINTS = JOINTS_PER_BODY + CROWN_POINT + HAND_POINT
 HEAD_RADIUS_M = 0.25
 J_HEAD = 15
+# SMPL-24 order, the same indices wave_detector reads off /pose/joints.
+J_LEFT_WRIST, J_RIGHT_WRIST = 20, 21
+J_LEFT_HAND, J_RIGHT_HAND = 22, 23
+# Smaller than HEAD_RADIUS_M because a hand is: wide enough to reach the
+# fingertips from the hand joint, tight enough not to reach up the forearm.
+HAND_RADIUS_M = 0.14
 
 
 def visible_fraction(mask_px: int, box_area: float) -> float:
@@ -236,6 +249,95 @@ def visible_height_fraction(mask: np.ndarray, depth_m: np.ndarray,
         return 1.0
     expected = fy * body_m / float(np.median(z))
     return 1.0 if expected <= 0.0 else float(extent / expected)
+
+
+def fit_floor_camera_frame(depth_m: np.ndarray, K: np.ndarray, rng) -> tuple:
+    """A floor plane in the camera's own frame: (normal, offset) or None.
+
+    Debug only, and deliberately not StableGroundPlane: that one fits in the
+    world frame and needs a camera pose from VIO, so on this rig -- which has
+    no odometry -- it has never run at all.  This wants to answer one
+    question, which is whether the camera is level.  The gesture test compares
+    a wrist against a crown along the camera's Y, and that is only the
+    person's own vertical if it is.
+    """
+    h, w = depth_m.shape[:2]
+    vv, uu = np.mgrid[0:h:8, 0:w:8]
+    z = depth_m[::8, ::8]
+    ok = np.isfinite(z) & (z > 0.4) & (z < 8.0)
+    if np.count_nonzero(ok) < 400:
+        return None
+    z = z[ok]; u = uu[ok]; v = vv[ok]
+    pts = np.column_stack(((u - K[0, 2]) * z / K[0, 0],
+                           (v - K[1, 2]) * z / K[1, 1], z))
+    # The floor is in the lower part of the image, and fitting the whole cloud
+    # finds the wall behind the people instead.
+    low = pts[pts[:, 1] > np.percentile(pts[:, 1], 60)]
+    if len(low) < 200:
+        return None
+    best_n, best_d, best_c = None, None, 0
+    for _ in range(80):
+        i = rng.choice(len(low), 3, replace=False)
+        a, b, c = low[i]
+        n = np.cross(b - a, c - a)
+        ln = np.linalg.norm(n)
+        if ln < 1e-6:
+            continue
+        n = n / ln
+        d = float(n @ a)
+        cnt = int(np.count_nonzero(np.abs(low @ n - d) < 0.04))
+        if cnt > best_c:
+            best_n, best_d, best_c = n, d, cnt
+    if best_n is None or best_c < 150:
+        return None
+    # Point the normal up (-Y in the optical frame) so the marker's rotation
+    # is not sometimes upside down.
+    if best_n[1] > 0:
+        best_n, best_d = -best_n, -best_d
+    return best_n, best_d
+
+
+def quat_from_z(n: np.ndarray):
+    """A quaternion taking +Z onto `n`, which is how RViz orients a flat box."""
+    zc = np.asarray([0.0, 0.0, 1.0])
+    n = n / max(float(np.linalg.norm(n)), 1e-9)
+    v = np.cross(zc, n)
+    c = float(zc @ n)
+    if float(np.linalg.norm(v)) < 1e-9:
+        return (0.0, 0.0, 0.0, 1.0) if c > 0 else (1.0, 0.0, 0.0, 0.0)
+    s = float(np.sqrt((1.0 + c) * 2.0))
+    return (v[0] / s, v[1] / s, v[2] / s, s / 2.0)
+
+
+def hand_top_of(verts: np.ndarray, joints: np.ndarray) -> np.ndarray:
+    """The highest point of either hand: the mesh, near a hand joint.
+
+    The counterpart of crown_of, and for the same reason.  A skeleton joint is
+    inside the body; what actually clears a head is the end of the fingers.
+    Y is down.
+    """
+    best = None
+    for j in (J_LEFT_HAND, J_RIGHT_HAND):
+        near = verts[np.linalg.norm(verts - joints[j], axis=1) < HAND_RADIUS_M]
+        cand = near[near[:, 1].argmin()] if len(near) else joints[j]
+        if best is None or cand[1] < best[1]:
+            best = cand
+    return best
+
+
+def with_crown(joints_m: np.ndarray, crown: np.ndarray,
+               bones_flat: np.ndarray) -> np.ndarray:
+    """The skeleton's segments, plus one from the head joint up to the crown.
+
+    Without it the highest thing drawn is J_HEAD, which sits at the base of
+    the skull -- measured on this camera, 21 cm below the crown.  A viewer
+    reads their hand as clearly above their head while the gesture test, which
+    compares against the crown, still says it is 15 cm short, and nothing on
+    screen explains the gap.  Drawing the segment puts the bar where it can be
+    seen.
+    """
+    return np.vstack([joints_m[bones_flat],
+                      joints_m[J_HEAD][None, :], crown[None, :]])
 
 
 def crown_of(verts: np.ndarray, joints: np.ndarray) -> np.ndarray:
@@ -540,6 +642,9 @@ def main():
     ap.add_argument("--people-hz", type=float, default=10.0,
                     help="how often ~/people is redrawn; it is a picture and "
                          "is skipped entirely when nothing subscribes to it")
+    ap.add_argument("--raised", default="/wave_detector/raised",
+                    help="track ids whose hand is up this frame, shown on "
+                         "each person's label")
     ap.add_argument("--label-size", type=float, default=0.12,
                     help="height of the per-person text label, in metres")
     ap.add_argument("--mesh-faces", type=int, default=2500,
@@ -598,6 +703,7 @@ def main():
 
     rgb_buf, depth_buf = StampBuffer(CAM_QUEUE), StampBuffer(CAM_QUEUE)
     st = {"K": None, "cam_frame": None, "instances": None, "instances_t": 0.0,
+          "hand_cm": {},
           "labels": {}, "tracks": {}, "target": -1, "epoch": None}
 
     # The fit loop sleeps between frames, and what it is waiting for is one of
@@ -636,16 +742,28 @@ def main():
     def on_target(m):
         st["target"] = int(m.data)
 
+    def on_raised(m):
+        # track id -> centimetres the higher wrist clears that person's own
+        # crown by, as the gesture detector reads it this frame.  Read from
+        # there rather than recomputed here so there is one test and not two
+        # that can disagree -- and instantaneous, because the policy's own
+        # answer remembers a raise for --wave-hold after the hand comes down,
+        # which is right for deciding and wrong for drawing.
+        d = list(m.data)
+        st["hand_cm"] = {int(d[i]): int(d[i + 1])
+                         for i in range(0, len(d) - 1, 2)}
+
     def on_rgb(m):
         st["cam_frame"] = m.header.frame_id or st["cam_frame"]
         rgb_buf.push(m)
 
-    from std_msgs.msg import Int32
+    from std_msgs.msg import Int32, Int32MultiArray
     from vision_msgs.msg import Detection2DArray
     node.create_subscription(Detection2DArray, args.instances, on_instances, qos)
     node.create_subscription(Image, args.instance_mask, on_labels, cam_qos)
     node.create_subscription(Detection2DArray, args.tracks, on_tracks, cam_qos)
     node.create_subscription(Int32, args.target, on_target, 10)
+    node.create_subscription(Int32MultiArray, args.raised, on_raised, 10)
 
     def on_epoch(m):
         st["epoch"] = int(m.data)
@@ -663,6 +781,10 @@ def main():
     pub_mesh = node.create_publisher(Marker, f"{ns}/human_mesh", 1)
     pub_facing = node.create_publisher(Marker, f"{ns}/human_facing", 1)
     pub_joints = node.create_publisher(Marker, f"{ns}/human_joints", 1)
+    # Debug only, and it costs nothing until somebody ticks it in RViz: the
+    # floor fit and the two planes are all behind a subscriber check.
+    pub_planes = node.create_publisher(MarkerArray, f"{ns}/debug_planes", 1)
+    floor_rng = np.random.default_rng(0)
     pub_people = node.create_publisher(MarkerArray, f"{ns}/people", 1)
     from sensor_msgs.msg import PointCloud2
     pub_bodies = node.create_publisher(PointCloud2, f"{ns}/joints", qos)
@@ -770,7 +892,8 @@ def main():
         return m
 
     def publish_bodies(bodies, header):
-        """Everyone's raw joints, one cloud, w = the TRACK id.
+        """Everyone's raw joints, the crown and the higher hand tip, one cloud,
+        w = the TRACK id.
 
         This is the machine-readable output the gesture policy reads; it is
         published whether or not anybody is designated, because deciding who
@@ -787,10 +910,11 @@ def main():
         import array
         from sensor_msgs.msg import PointCloud2, PointField
         data = np.zeros((len(bodies) * BODY_POINTS, 4), np.float32)
-        for k, (track_id, joints, crown) in enumerate(bodies):
+        for k, (track_id, joints, crown, hand_top) in enumerate(bodies):
             lo = k * BODY_POINTS
             data[lo:lo + JOINTS_PER_BODY, :3] = joints[:JOINTS_PER_BODY]
             data[lo + JOINTS_PER_BODY, :3] = crown
+            data[lo + JOINTS_PER_BODY + 1, :3] = hand_top
             data[lo:lo + BODY_POINTS, 3] = float(track_id)
         msg = PointCloud2()
         msg.header.stamp = header.stamp
@@ -808,6 +932,52 @@ def main():
         ]
         msg.data = array.array("B", data.tobytes())
         pub_bodies.publish(msg)
+
+    def publish_debug_planes(joints_m, crown, hand_top, depth_m, K,
+                             frame, stamp):
+        """The three surfaces the raised-hand test is actually comparing.
+
+        The test is one subtraction -- the higher wrist's Y against the
+        crown's, both in the camera's frame -- and from in front of the camera
+        there is no way to see where either of them is, which is most of why
+        "my hand is over my head and it says no" is hard to answer.  Two of
+        these planes ARE the test.  The floor is not part of it and is drawn
+        for a different reason: the test's vertical is the camera's Y, and that
+        is only the person's vertical if the camera is level.  A floor that
+        comes out visibly tilted against the other two says it is not.
+        """
+        if pub_planes.get_subscription_count() == 0:
+            return
+        arr = MarkerArray()
+        wrist = hand_top
+
+        def plane(mid, centre, normal, colour, size=1.6):
+            m = Marker()
+            m.header.frame_id, m.header.stamp = frame, stamp
+            m.ns, m.id, m.type, m.action = "planes", mid, Marker.CUBE, Marker.ADD
+            m.pose.position.x = float(centre[0])
+            m.pose.position.y = float(centre[1])
+            m.pose.position.z = float(centre[2])
+            q = quat_from_z(np.asarray(normal, float))
+            (m.pose.orientation.x, m.pose.orientation.y,
+             m.pose.orientation.z, m.pose.orientation.w) = q
+            m.scale.x, m.scale.y, m.scale.z = size, size, 0.004
+            m.color = colour
+            arr.markers.append(m)
+            return m
+
+        up = np.asarray([0.0, -1.0, 0.0])               # camera frame, Y down
+        plane(0, crown, up, ColorRGBA(r=0.2, g=0.8, b=1.0, a=0.35))
+        plane(1, wrist, up, ColorRGBA(r=1.0, g=0.45, b=0.1, a=0.35))
+        got = fit_floor_camera_frame(depth_m, K, floor_rng)
+        if got is not None:
+            n, d = got
+            # Put it under the person rather than at the origin, so the three
+            # are in one view.
+            foot = np.asarray(joints_m[0], float)
+            centre = foot - n * float(n @ foot - d)
+            plane(2, centre, n, ColorRGBA(r=0.6, g=0.6, b=0.6, a=0.30), 3.0)
+        pub_planes.publish(arr)
 
     def publish_fit_cloud(cloud, colours, frame, stamp):
         """What refine_to_cloud was given, in the person's own colours.
@@ -1199,8 +1369,11 @@ def main():
         jm = marker(2, Marker.LINE_LIST, out_frame, stamp,
                     (0.018, 0.0, 0.0),
                     ColorRGBA(r=0.95, g=0.95, b=0.35, a=1.0))
-        jm.points = bone_pool.fill(joints_m[bones])
+        crown = crown_of(verts_m, joints_m)
+        jm.points = bone_pool.fill(with_crown(joints_m, crown, bones))
         pub_joints.publish(jm)
+        publish_debug_planes(joints_m, crown, hand_top_of(verts_m, joints_m),
+                             depth_m, K, out_frame, stamp)
         shown[0] = True
         last_drawn[0] = time.monotonic()
         prof["markers"] += (time.monotonic() - t_stage) * 1e3
@@ -1293,7 +1466,8 @@ def main():
                         sk = marker(mid_of(track), Marker.LINE_LIST,
                                     frame, stamp, (0.012, 0.0, 0.0), colour)
                         sk.ns = "people"
-                        sk.points = to_points(joints_m[bones])
+                        sk.points = to_points(
+                            with_crown(joints_m, anchor, bones))
                         arr.markers.append(sk)
                         drawn.add(sk.id)
             if anchor is None:
@@ -1303,18 +1477,36 @@ def main():
                          (0.0, 0.0, args.label_size), colour)
             txt.ns = "people"
             drawn.add(txt.id)
-            # The track number was here and meant nothing to anybody
-            # watching: it is bookkeeping between two nodes, it changes when
-            # somebody walks out and comes back, and it crowded out the one
-            # figure that answers a viewer's actual question -- why is there no
-            # body on that person.  Only the target is worth naming, and only
-            # as the target.
-            txt.text = (f"TRACKED  {visible * 100:.0f}%" if is_target
-                        else f"{visible * 100:.0f}%")
-            # Y is down in the optical frame, so up is -y: the label floats
-            # above the head rather than inside it.
+            # Stacked, not strung out.  RViz centres a TEXT_VIEW_FACING
+            # marker on its pose and scales the width with the string, so
+            # "TRACKED  67%" was about 0.7 m across at --label-size 0.12 and
+            # reached over the head of whoever was standing next to them.  One
+            # short word per line keeps it as narrow as its longest word.
+            #
+            # The track number is gone from it: that is bookkeeping between two
+            # nodes, it changes when somebody walks out and comes back, and it
+            # crowded out the figure that answers the viewer's actual question,
+            # which is why there is no body on that person.
+            lines = []
+            if is_target:
+                lines.append("TRACKED")
+            cm = st["hand_cm"].get(track)
+            if cm is not None and cm >= 0:
+                lines.append("WAVING")
+            elif cm is not None and cm > -40:
+                # Close but under the bar.  Showing the gap rather than
+                # nothing: from in front of a camera, a hand at ear height and
+                # a hand by your side look identical on a label that only says
+                # yes or no, and the distance between them is the question.
+                lines.append(f"hand {cm}cm")
+            lines.append(f"{visible * 100:.0f}%")
+            txt.text = "\n".join(lines)
+            # Y is down in the optical frame, so up is -y.  The block grows
+            # both ways from its centre, so the offset clears the crown by the
+            # half-height it will have plus a little air.
             txt.pose.position.x = float(anchor[0])
-            txt.pose.position.y = float(anchor[1] - args.label_size * 2.0)
+            txt.pose.position.y = float(
+                anchor[1] - args.label_size * (0.6 * len(lines) + 0.5))
             txt.pose.position.z = float(anchor[2])
             arr.markers.append(txt)
 
@@ -1556,7 +1748,8 @@ def main():
             else:
                 t_id = track_of.get(instance_of(target_det))
                 if t_id is not None:
-                    bodies.append((t_id, got[1], crown_of(got[2], got[1])))
+                    bodies.append((t_id, got[1], crown_of(got[2], got[1]),
+                               hand_top_of(got[2], got[1])))
 
             # ---- the person being followed, first of all --------------------
             # Their skeleton is what downstream acts on and what a viewer is
@@ -1609,7 +1802,8 @@ def main():
                     people.append((tid, vis, other))
                     if other is not None:
                         bodies.append(
-                            (tid, other[1], crown_of(other[2], other[1])))
+                            (tid, other[1], crown_of(other[2], other[1]),
+                             hand_top_of(other[2], other[1])))
             prof["others"] += (time.monotonic() - t_stage) * 1e3
 
             # ---- everybody's joints, for the gesture policy ------------------
