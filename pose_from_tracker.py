@@ -632,13 +632,12 @@ def main():
                          "outlast every reason a person can be missing "
                          "without having left, and those compound: at "
                          "--others-hz 3 a bystander gets a chance every 333 "
-                         "ms, and measured on an Orin 10-20%% of those chances "
-                         "are lost to a track that did not associate, an "
-                         "instance mask that did not arrive for that stamp, or "
-                         "a frame where too little of them showed.  Two misses "
-                         "in a row is already a second.  0.6 s was tried as a "
-                         "constant and a standing bystander still blinked "
-                         "every two seconds")
+                         "ms, and measured on an Orin the redraws actually "
+                         "land at 1.3 Hz: more than half the chances go to a "
+                         "frame with no track id for them, a mask too small "
+                         "to describe, or depth that could not place them.  "
+                         "0.6 s and then 1.33 s were both tried as a bound "
+                         "and a standing bystander still blinked")
     ap.add_argument("--people-hz", type=float, default=10.0,
                     help="how often ~/people is redrawn; it is a picture and "
                          "is skipped entirely when nothing subscribes to it")
@@ -651,6 +650,14 @@ def main():
                     help="decimate the body to this many triangles before "
                          "publishing it; 0 keeps SMPL's 13776, which costs "
                          "41328 Point objects a frame")
+    ap.add_argument("--idle-others-hz", type=float, default=8.0,
+                    help="how often the other people are fitted while nobody "
+                         "is designated.  Higher than --others-hz, because "
+                         "nobody's skeleton is waiting behind them and this "
+                         "is the rate a NEW waver is noticed at -- but "
+                         "bounded, which it was not: it used to be every "
+                         "frame, and two bystanders' TokenHMR is more than a "
+                         "loop")
     ap.add_argument("--others-hz", type=float, default=25.0,
                     help="how often the people who are not the target are "
                          "fitted, while there is a target; with nobody "
@@ -853,7 +860,13 @@ def main():
     bones = np.asarray(PIPE.SMPL_BONES, np.int32).reshape(-1)
     VIS_STRIDE = max(1, int(args.vis_stride))
     if args.people_hold is None:
-        args.people_hold = max(0.6, 4.0 / max(args.others_hz, 0.1))
+        # Eight periods, not four.  The rate a bystander is actually drawn at
+        # is well under --others-hz: measured on an Orin at 3 Hz, one standing
+        # person was redrawn 19 times in 15 s -- 1.3 Hz -- because more than
+        # half the opportunities go to a frame with no track id for them, a
+        # mask too small to describe, or depth that could not place them.  A
+        # hold sized from the nominal rate expires in the gaps that leaves.
+        args.people_hold = max(1.5, 8.0 / max(args.others_hz, 0.1))
     root_stab = PIPE.RootStabiliser(args.root_max_speed, args.root_grace)
     # After the outlier rejection, not instead of it: one stops the body
     # teleporting, the other stops it trembling while its owner sits still.
@@ -988,7 +1001,7 @@ def main():
         sampling the colour image at those pixels costs a gather and makes the
         cloud show which part of the person each point is.
         """
-        if pub_fit_cloud.get_subscription_count() == 0 or not len(cloud):
+        if pub_fit_cloud.get_subscription_count() == 0:
             return
         import array
         from sensor_msgs.msg import PointField
@@ -1029,6 +1042,13 @@ def main():
             m.header.stamp = node.get_clock().now().to_msg()
             m.ns, m.id, m.action = "human", mid, Marker.DELETE
             pub.publish(m)
+        # A point cloud has no DELETE: it is cleared by sending an empty one.
+        # Without this the last cloud the target produced stayed on screen
+        # after they walked out -- a person-shaped ghost standing where they
+        # had been, which is worse than nothing because it looks like data.
+        publish_fit_cloud(np.zeros((0, 3), np.float32), None,
+                          st["cam_frame"] or args.world_frame,
+                          node.get_clock().now().to_msg())
         shown[0] = False
 
     def clear_people():
@@ -1783,9 +1803,18 @@ def main():
             # mesh-drawing thread in publish_mesh, for a different reason: that
             # one lost to the GIL, this one to the device.)
             t_stage = time.monotonic()
-            others_fresh = (target_det is None
-                            or loop_t0 - last_others_t[0]
-                            >= 1.0 / max(args.others_hz, 0.1))
+            # With nobody to follow there is no target latency to protect and
+            # everyone is a candidate, so this rate goes up -- but not to
+            # "every frame", which is what `target_det is None` used to mean.
+            # One bystander is ~45 ms of TokenHMR, and two of them unthrottled
+            # is the loop doing nothing else: measured, it is what the view
+            # stutters on the moment the target walks out of shot, and again
+            # for as long as re-acquiring them takes, because a designated
+            # target this frame cannot resolve to is None here too.  The rate
+            # limit was lifted so /pose/joints would not go empty between
+            # fits; --idle-others-hz keeps that without taking the whole loop.
+            rate = args.others_hz if target_det is not None else args.idle_others_hz
+            others_fresh = (loop_t0 - last_others_t[0] >= 1.0 / max(rate, 0.1))
             if others_fresh:
                 last_others_t[0] = loop_t0
                 for det in crowd:
