@@ -38,7 +38,8 @@ skeleton on the wire, not counting the camera driver's own 30-45 ms:
                                score and instance id per detection
        /tracker/instance_mask  16UC1, pixel = instance id, same stamp
        /tracker/tracks         instance id to track id, as "<track>:<instance>"
-       /tracker/target         std_msgs/Int32, the track to draw, -1 for none
+       /tracker/target         std_msgs/Int32, the caregiver, -1 for none
+       /tracker/patient        std_msgs/Int32, the second lock, -1 for none
        the camera's colour/depth/info topics, paired BY STAMP.
 
   out  ~/human_pose    geometry_msgs/PoseStamped  pelvis position, +x = facing
@@ -56,10 +57,17 @@ skeleton on the wire, not counting the camera driver's own 30-45 ms:
 
 Notes on the contract:
 
-  * "Nobody designated" is a -1 on /tracker/target, not a silence, and the
-    markers are deleted rather than left standing.  A consumer can tell
-    "nobody" from "the publisher died"; this node treats an instance array
-    older than --tracker-timeout as the second.
+  * The SUBJECT -- the one body that is grounded, refined and drawn in the
+    target's colour -- is the patient when the tracker is holding one and the
+    caregiver otherwise.  Both locks travel separately because the caregiver
+    stays held across a handover; what moves is only which of them is being
+    looked at.  Everybody else, the caregiver included once a handover has
+    happened, is a bystander here and gets the cheap fit.
+
+  * "Nobody designated" is a -1 on both, not a silence, and the markers are
+    deleted rather than left standing.  A consumer can tell "nobody" from "the
+    publisher died"; this node treats an instance array older than
+    --tracker-timeout as the second.
 
   * A frame the target could not be fitted on is neither.  It is a tracks
     message that did not arrive for that stamp, or a mask a hair too small,
@@ -558,6 +566,11 @@ def main():
                     help="16UC1, pixel = instance id, from the same frame")
     ap.add_argument("--tracks", default="/tracker/tracks",
                     help="instance id to track id, written as '<track>:<instance>'")
+    ap.add_argument("--patient", default="/tracker/patient",
+                    help="the tracker's second lock.  While it names somebody "
+                         "they are the body this node fits, and the caregiver "
+                         "on --target is drawn as a bystander -- still "
+                         "tracked, just not the one being looked at")
     ap.add_argument("--target", default="/tracker/target",
                     help="the track id whose body is grounded, refined and "
                          "drawn; everyone else gets joints only")
@@ -711,7 +724,34 @@ def main():
     rgb_buf, depth_buf = StampBuffer(CAM_QUEUE), StampBuffer(CAM_QUEUE)
     st = {"K": None, "cam_frame": None, "instances": None, "instances_t": 0.0,
           "hand_cm": {},
-          "labels": {}, "tracks": {}, "target": -1, "epoch": None}
+          "labels": {}, "tracks": {}, "target": -1, "epoch": None,
+          "patient": -1, "patient_epoch": None}
+
+    def subject():
+        """Whose body is grounded, refined and drawn as the target.
+
+        The caregiver until a handover names a patient, the patient after.
+        The tracker holds both -- the caregiver does not stop being tracked
+        when the pose moves off them -- so which one this is comes down to
+        whether there is a patient at all.
+        """
+        return st["patient"] if st["patient"] >= 0 else st["target"]
+
+    def subject_epoch():
+        """Which PERSON the subject is, as one value that can be compared.
+
+        The role is part of it.  A handover moves the pose from one person to
+        another without either lock's own epoch moving -- neither of them was
+        re-designated -- and that is exactly the change the body filters, the
+        root stabiliser and the shape estimate have to start over for.
+        """
+        if st["patient"] >= 0:
+            role, epoch, tid = 1, st["patient_epoch"], st["patient"]
+        else:
+            role, epoch, tid = 0, st["epoch"], st["target"]
+        # Without an epoch from the tracker the id has to stand in for
+        # identity again, and a re-acquisition then reads as a new person.
+        return (role, epoch) if epoch is not None else (role, "id", tid)
 
     # The fit loop sleeps between frames, and what it is waiting for is one of
     # these callbacks.  Polling for them on a timer costs half the poll
@@ -749,6 +789,12 @@ def main():
     def on_target(m):
         st["target"] = int(m.data)
 
+    def on_patient(m):
+        st["patient"] = int(m.data)
+
+    def on_patient_epoch(m):
+        st["patient_epoch"] = int(m.data)
+
     def on_raised(m):
         # track id -> centimetres the higher wrist clears that person's own
         # crown by, as the gesture detector reads it this frame.  Read from
@@ -770,6 +816,8 @@ def main():
     node.create_subscription(Image, args.instance_mask, on_labels, cam_qos)
     node.create_subscription(Detection2DArray, args.tracks, on_tracks, cam_qos)
     node.create_subscription(Int32, args.target, on_target, 10)
+    node.create_subscription(Int32, args.patient, on_patient, 10)
+    node.create_subscription(Int32, f"{args.patient}_epoch", on_patient_epoch, 10)
     node.create_subscription(Int32MultiArray, args.raised, on_raised, 10)
 
     def on_epoch(m):
@@ -803,8 +851,9 @@ def main():
     # nothing is trying to match it to.
     pub_fit_cloud = node.create_publisher(PointCloud2, f"{ns}/fit_cloud", qos)
     print(f"pose_from_tracker: {args.instances} -> {ns}/joints (everyone), "
-          f"{ns}/human_{{pose,mesh,facing,joints}} (the target from "
-          f"{args.target})", flush=True)
+          f"{ns}/human_{{pose,mesh,facing,joints}} (the subject: "
+          f"{args.patient} when it names somebody, else {args.target})",
+          flush=True)
 
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
 
@@ -892,6 +941,13 @@ def main():
     fit_dz = deque(maxlen=600)
     fit_match = deque(maxlen=600)
     root_gap = deque(maxlen=600)
+    # One row per placed frame, for the question "why is the skeleton in front
+    # of its own point cloud when the person turns side-on".  Every term the
+    # answer could be is in here: how side-on they are, the offset that bought,
+    # whether the registration ran or bailed, what it moved, and where the
+    # pelvis actually came out.  Bucketed by facing on the way out, because the
+    # complaint is about one bucket and an average over all of them hides it.
+    place_log = deque(maxlen=900)
     last_logged = [0]
     mesh_pool, bone_pool = PointPool(), PointPool()
 
@@ -1149,7 +1205,7 @@ def main():
         Until then the last body stays up, and only --idle-hold of continuous
         silence takes it down.
         """
-        if st["target"] >= 0 and time.monotonic() - last_drawn[0] < args.idle_hold:
+        if subject() >= 0 and time.monotonic() - last_drawn[0] < args.idle_hold:
             return
         clear()
         # Whoever this was is gone, so every filter that assumed one person
@@ -1230,8 +1286,13 @@ def main():
 
         t_stage = time.monotonic()
         forward = PIPE.body_forward(joints)
-        raw_root = PIPE.metric_root(pelvis_px, depth_m, K, mask,
-                                    PIPE.root_offset_for(forward))
+        # |cos| between the body's forward axis and the camera's: 1 facing the
+        # camera, 0 in profile.  root_offset_for reads the same number, and it
+        # is read out here because it is the axis the complaint is about.
+        frontal = (abs(float(forward[2])) if forward is not None else
+                   float("nan"))
+        offset = PIPE.root_offset_for(forward)
+        raw_root = PIPE.metric_root(pelvis_px, depth_m, K, mask, offset)
         root = raw_root
         if root is not None:
             blended = PIPE.blend_root(root, PIPE.MODEL_CAM_T, K)
@@ -1269,9 +1330,15 @@ def main():
         # points they are matched against -- the registration is a weighted
         # median over correspondences, which is exactly the kind of estimate
         # that loses precision as the square root of the count.
-        vis_idx = PIPE.visible_vertices(
-            verts_m, K, mask, depth_m,
-            candidate_idx=np.arange(0, len(verts_m), VIS_STRIDE))
+        # HPR on the strided subset, and the indices mapped back.  This used
+        # to pass the stride itself as `candidate_idx`, which that argument
+        # takes to mean "here is an HPR set already, reuse it" -- so the test
+        # was skipped entirely and every other vertex of the WHOLE body, front
+        # surface and back, went into the registration as "camera-visible".
+        # Measured: the stage cost 0.1 ms against the 13.6 ms the comment
+        # below budgets for it, which is what a test that does not run costs.
+        sub = np.arange(0, len(verts_m), VIS_STRIDE)
+        vis_idx = sub[PIPE.visible_vertices(verts_m[sub], K, mask, depth_m)]
         prof["g_vis"] += (time.monotonic() - t_sub) * 1e3
 
         # The registration's whole output is one number: a z-shift.  Rotation
@@ -1327,6 +1394,16 @@ def main():
         fit_match.append(lr["matched"] / max(lr["cloud"], 1))
         root_why[lroot["why"]] += 1
         root_gap.append(abs(lroot["model"] - lroot["depth"]))
+        # Every term the published depth is made of, so the one that is
+        # shuttling can be named rather than guessed at.  In order: what the
+        # sensor said, what the model said, what the blend chose between them,
+        # and what the registration added on top.
+        place_log.append((frontal, float(offset), float(lr["dz"]),
+                          lr["why"], lroot["why"],
+                          float(joints_m[0][2]),
+                          lr["matched"] / max(lr["cloud"], 1),
+                          float(lroot["depth"]), float(lroot["model"]),
+                          float(lroot["out"])))
         forward = PIPE.body_forward(joints_m)
         if forward is not None:
             # The arrow and the mesh's facing wobbled 1.2 deg a frame on a
@@ -1508,7 +1585,17 @@ def main():
             # crowded out the figure that answers the viewer's actual question,
             # which is why there is no body on that person.
             lines = []
-            if is_target:
+            # Which of the two locks this is, while there are two.  With no
+            # handover in progress there is only one person to name and
+            # "CAREGIVER" would be saying something the scene does not show;
+            # once the pose has moved, which body is which is the whole
+            # question a viewer is asking.
+            if st["patient"] >= 0:
+                if track == st["patient"]:
+                    lines.append("PATIENT")
+                elif track == st["target"]:
+                    lines.append("CAREGIVER")
+            elif is_target:
                 lines.append("TRACKED")
             cm = st["hand_cm"].get(track)
             if cm is not None and cm >= 0:
@@ -1617,6 +1704,64 @@ def main():
     PROF_KEYS = ("decode", "fit", "ground", "mesh", "markers", "others",
                  "joints", "people", "g_vis", "cloud", "fitcloud", "g_refine")
 
+    def _place_report(rows):
+        """Where the target ended up, split by how side-on they were.
+
+        Three buckets, because the failure being chased lives in one of them:
+        a body in profile is narrow, its cloud is small, and the registration
+        that is supposed to pull the mesh back onto it has the fewest
+        correspondences exactly when the placement it is correcting is least
+        reliable.  `bail` is the fraction of frames the registration refused to
+        run on -- those publish the mesh wherever the root offset put it, which
+        in profile is half a torso WIDTH in front of the person.
+
+        `flip` is the oscillation: of the frame-to-frame changes in published
+        pelvis z, how many reversed direction.  Somebody walking gives a low
+        number; a body shuttling along the camera axis while its owner stands
+        still gives one near 0.5.
+        """
+        out = []
+        for name, lo, hi in (("profile", -0.01, 0.34),
+                             ("oblique", 0.34, 0.77),
+                             ("frontal", 0.77, 1.01)):
+            b = [r for r in rows if lo < r[0] <= hi]
+            if len(b) < 5:
+                continue
+            dz = np.abs([r[2] for r in b]) * 100
+            bail = sum(1 for r in b if r[3] != "ok") / len(b)
+            match = np.median([r[6] for r in b]) * 100
+            zs = np.asarray([r[5] for r in b])
+            d = np.diff(zs)
+            flip = (float(np.mean(np.sign(d[1:]) * np.sign(d[:-1]) < 0))
+                    if len(d) > 2 else float("nan"))
+            step = np.abs(d) * 100
+            out.append(
+                f"{name} n={len(b)} off={np.median([r[1] for r in b])*100:.0f}cm "
+                f"dz p50 {np.median(dz):.1f} p90 {np.percentile(dz, 90):.0f}cm "
+                f"bail {bail*100:.0f}% match {match:.0f}% "
+                f"zstep p50 {np.median(step):.1f} p95 "
+                f"{np.percentile(step, 95):.1f}cm flip {flip*100:.0f}%")
+        # Which term is moving.  The published depth is z_depth blended with
+        # z_model, then shifted by dz, so one of those four is the one that
+        # shuttles and the other three are along for the ride.
+        terms = []
+        for i, name in ((7, "z_depth"), (8, "z_model"), (9, "z_blend"),
+                        (1, "offset"), (2, "dz")):
+            a = np.asarray([r[i] for r in rows], float)
+            a = a[np.isfinite(a)]
+            if len(a) < 5:
+                continue
+            d = np.diff(a)
+            f = (float(np.mean(np.sign(d[1:]) * np.sign(d[:-1]) < 0))
+                 if len(d) > 2 else float("nan"))
+            terms.append(f"{name} step p50 {np.median(np.abs(d))*100:.1f} "
+                         f"p95 {np.percentile(np.abs(d), 95)*100:.1f}cm "
+                         f"flip {f*100:.0f}%")
+        whys = Counter(r[3] for r in rows) + Counter(r[4] for r in rows)
+        return ("  |  ".join(out) + "\n         " + "  ".join(terms)
+                + "\n         " + " ".join(
+                    f"{k}={v}" for k, v in whys.most_common(5)))
+
     def new_prof():
         p = {k: 0.0 for k in PROF_KEYS}
         p["pose_age"], p["mesh_age"] = [], []
@@ -1686,12 +1831,13 @@ def main():
                 wait_for_input(period)
                 continue
 
-            # Which instance the target track is, this frame.  Identity is the
-            # tracker's business; all this node does is look the answer up.
+            # Which instance the subject track is, this frame.  Identity is
+            # the tracker's business; all this node does is look the answer up.
+            subj, subj_epoch = subject(), subject_epoch()
             track_of = st["tracks"].get(key, {})
             target_instance = next(
-                (i for i, t in track_of.items() if t == st["target"]), None)
-            if st["target"] < 0:
+                (i for i, t in track_of.items() if t == subj), None)
+            if subj < 0:
                 why["none designated"] += 1
             elif not track_of:
                 why["no tracks for this stamp"] += 1
@@ -1715,12 +1861,15 @@ def main():
             # out and in several times a minute, which is most of what "the
             # mesh keeps flickering" was.  The tracker says which kind of
             # change it is; only its epoch starts anything over.
-            changed = (st["target"] != last_target[0] if st["epoch"] is None
-                       else st["epoch"] != last_epoch[0])
+            # A handover is the third kind of change, and the one neither of
+            # the two above can see: both locks keep the epochs they had, and
+            # the id moves to somebody who was a bystander a frame ago.
+            # subject_epoch folds the role in so it reads as what it is.
+            changed = subj_epoch != last_epoch[0]
             if changed:
                 if last_target[0] is not None:
                     node.get_logger().info(
-                        f"target #{last_target[0]} -> #{st['target']}: "
+                        f"subject #{last_target[0]} -> #{subj}: "
                         "resetting the body filters")
                 clear()
                 root_stab.reset()
@@ -1731,11 +1880,11 @@ def main():
                 # converged -- clearing the lot made the new target start from
                 # a cold estimate that the room had to re-warm.
                 ML.reset_betas_state(last_target[0])
-            elif st["target"] != last_target[0]:
+            elif subj != last_target[0]:
                 node.get_logger().info(
-                    f"target #{last_target[0]} -> #{st['target']}: same person, "
+                    f"subject #{last_target[0]} -> #{subj}: same person, "
                     "keeping the body")
-            last_target[0], last_epoch[0] = st["target"], st["epoch"]
+            last_target[0], last_epoch[0] = subj, subj_epoch
 
             # ---- the target first, and alone ---------------------------------
             # Whoever is designated is the only body anybody is looking at, so
@@ -1761,7 +1910,7 @@ def main():
             if got is None:
                 # Nobody designated, or the designated one is not fittable this
                 # frame.  The others are still worth fitting, below.
-                if st["target"] >= 0 and target_instance is not None:
+                if subj >= 0 and target_instance is not None:
                     why["target too hidden to fit"] += 1
                 idles += 1
                 go_idle()
@@ -1851,7 +2000,7 @@ def main():
             # on has already gone out.
             publish_people(people, track_of, target_instance, depth_m, K,
                            inst_msg.header.stamp, loop_t0, prof,
-                           target_unresolved=(st["target"] >= 0
+                           target_unresolved=(subj >= 0
                                               and target_instance is None),
                            others_fresh=others_fresh)
             if placed is not None:
@@ -1888,6 +2037,9 @@ def main():
                           + "  ".join(f"{k}={v}" for k, v in root_why.most_common()),
                           flush=True)
                     fit_why.clear(); root_why.clear()
+                if len(place_log) > 30:
+                    rows = list(place_log)
+                    print("[Place] " + _place_report(rows), flush=True)
                 if len(jumps["out"]) > 30:
                     a, b = np.asarray(jumps["in"]), np.asarray(jumps["out"])
                     print(f"[RootJump] depth said p50 {np.median(a)*100:.1f} "
