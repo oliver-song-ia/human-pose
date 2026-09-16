@@ -385,7 +385,7 @@ def blend_root(depth_root, cam_info, K, alpha=None):
                          out=float(np.asarray(depth_root)[2]),
                          why="model z out of range")
         return depth_root
-    a = MODEL_ROOT_ALPHA if alpha is None else alpha
+    a0 = MODEL_ROOT_ALPHA if alpha is None else alpha
     out = np.asarray(depth_root, np.float32).copy()
     z_depth = float(out[2])
     # The blend absorbs a wrong ROOT_OFFSET -- a ~10 cm constant.  When the
@@ -400,7 +400,25 @@ def blend_root(depth_root, cam_info, K, alpha=None):
     # here; that it is, is.  Depth measured the surface it can actually see, so
     # past this band depth wins, and the remaining ROOT_OFFSET error is what
     # refine_to_cloud is for.
-    if abs(z_model - z_depth) > MODEL_ROOT_MAX_DISAGREE:
+    # Fade the model out rather than switch it off.  This used to be a hard
+    # cut at MODEL_ROOT_MAX_DISAGREE, and a hard switch on a noisy comparison
+    # is an oscillator: measured live on a seated person at 3.05 m, the
+    # disagreement sat either side of the 25 cm line and the branch flipped on
+    # 43% of frames, each flip worth a * gap in one frame.  It showed up as the
+    # blend's own output stepping p95 13.2 cm between frames while its two
+    # INPUTS stepped 4.0 and 5.5 -- an average that moves more than either
+    # thing being averaged is not averaging, it is switching -- and on screen
+    # as the body shuttling along the camera axis with the person sitting
+    # still (the sign of the step reversed on 64% of frames).
+    #
+    # The weight now falls to zero AT that same distance, with zero slope, so
+    # the two endpoints keep the behaviour they were chosen for -- blend when
+    # the two agree, believe the sensor when they do not -- and crossing
+    # between them costs nothing.
+    gap = abs(z_model - z_depth)
+    t = min(1.0, gap / MODEL_ROOT_MAX_DISAGREE) if MODEL_ROOT_MAX_DISAGREE > 0 else 1.0
+    a = a0 * (1.0 - t) ** 2
+    if a <= 1e-3:
         LAST_ROOT.update(depth=z_depth, model=z_model, out=z_depth,
                          why="model too far from depth")
         return depth_root
