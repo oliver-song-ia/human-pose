@@ -1878,12 +1878,35 @@ def main():
     buffer_span_ns = int(rgb_buf.q.maxlen / 30.0 * 1e9)
     last_key = None
 
+    # A node that never fits anything used to say NOTHING: every counter this
+    # loop keeps is printed alongside [PoseProfile], which fires once per 30
+    # fits, so zero fits means zero diagnostics.  That is exactly the state
+    # that needs explaining -- one run on an Orin sat at "0 fits" for twenty
+    # minutes and the only evidence was the single summary line it printed on
+    # the way out.  So say so while it is happening, and say which input is
+    # missing rather than that the answer is.
+    last_beat = [time.monotonic()]
+
+    def heartbeat(now):
+        if fits or now - last_beat[0] < 5.0:
+            return
+        last_beat[0] = now
+        have = {"tracks": st["frame"] is not None, "K": st["K"] is not None,
+                "masks": bool(st["labels"]), "rgb": bool(len(rgb_buf.q)),
+                "depth": bool(len(depth_buf.q))}
+        print("[PoseIdle] no fits yet.  arrived: "
+              + " ".join(f"{k}={'yes' if v else 'NO'}" for k, v in have.items())
+              + "  |  " + "  ".join(f"{k}={v}" for k, v in exits.most_common())
+              + "  |  " + "  ".join(f"{k}={v}" for k, v in why.most_common()),
+              flush=True)
+
     try:
         while rclpy.ok():
             loop_t0 = time.monotonic()
             if args.run_seconds and loop_t0 - t_start > args.run_seconds:
                 break
             reset_stale_markers()        # one-shot, self-disabling
+            heartbeat(loop_t0)
 
             inst_msg, K = st["frame"], st["K"]
             if (inst_msg is None or K is None
