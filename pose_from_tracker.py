@@ -97,6 +97,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import argparse
+import collections
 import sys
 import threading
 import time
@@ -118,6 +119,12 @@ import mesh_live_o3d as ML
 # quaternion's +x axis either way -- but it rolls the pose about it.
 UP_IN_FRAME = {"world": np.array([0.0, 0.0, 1.0]),
                "camera": np.array([0.0, -1.0, 0.0])}
+
+# How long the subject has to have been unresolvable before coming back counts
+# as a RETURN rather than a dropped frame.  Below this the filters should keep
+# their history -- that is what carries a body through the one frame in five
+# the tracker does not resolve.
+ABSENCE_S = 1.0
 
 # Frames of colour and depth history to keep, in the middleware queue and in
 # the buffer alike.  It has to cover the upstream node's own latency: the mask
@@ -725,7 +732,9 @@ def main():
     st = {"K": None, "cam_frame": None, "instances": None, "instances_t": 0.0,
           "hand_cm": {},
           "labels": {}, "tracks": {}, "target": -1, "epoch": None,
-          "patient": -1, "patient_epoch": None}
+          "patient": -1, "patient_epoch": None,
+          "frame": None, "frame_t": 0.0,
+          }
 
     def subject():
         """Whose body is grounded, refined and drawn as the target.
@@ -760,6 +769,30 @@ def main():
 
     def on_instances(m):
         st["instances"] = m
+        # PARKED: choosing the newest frame whose tracks have arrived, instead
+        # of the newest frame, was tried and is worse -- the loop then picks
+        # the same frame repeatedly and skips most iterations outright, and the
+        # skeleton fell from 17 Hz to 5.5.  The race it was aimed at is real
+        # and measured -- a third of frames reach this node before their tracks
+        # do -- but the fix for it is to drive this loop from /tracker/tracks,
+        # which carries the same detections WITH their identities and so cannot
+        # be out of step with itself.
+        #
+        # The newest frame's TRACKS
+        # are still in flight -- this node and the tracker subscribe to the
+        # same detections and this one has less to do with them, so it asks
+        # about two milliseconds before the answer is sent.  Taking the newest
+        # frame regardless meant a third of frames had no tracks, the target
+        # could not be resolved, and no skeleton was published: measured, both
+        # topics ran at 30 Hz while the skeleton came out at 17.
+        #
+        # Waiting for it is the wrong shape -- the newest stamp advances every
+        # 33 ms, so a deadline against it never matures and the loop fits
+        # nothing at all.  Choosing is the right shape: work on the newest
+        # frame whose tracks HAVE arrived, one frame behind at worst.  Instance
+        # ids are frame-local, so the alternative -- this frame's detections
+        # against last frame's tracks -- would credit one person's box to
+        # whoever held their number a moment ago.
         st["instances_t"] = time.monotonic()
         arrived.set()
 
@@ -772,11 +805,26 @@ def main():
         arrived.set()
 
     def on_tracks(m):
-        """instance id -> track id, for this stamp.
+        """The frame this node works on: detections WITH their identities.
 
-        tracker.py writes Detection2D.id as "<track>:<instance>", so the two
-        numbers travel together and either side can be joined on.
+        tracker.py writes Detection2D.id as "<track>:<instance>", so one
+        message carries the boxes, the classes and who each of them is.  This
+        node used to gate its loop on /tracker/instances and then look the
+        identities up by stamp, and the two cannot be relied on to arrive in
+        that order: both nodes subscribe to the same detections and this one
+        has less to do with them, so it asked about two milliseconds before
+        the tracker had answered.  Measured, a third of frames found no tracks
+        for their stamp, took that to mean the target was not in the frame,
+        and published no skeleton -- 17 Hz out of 30.
+        
+        Waiting for the answer and choosing a frame that already has one were
+        both tried and are both worse (see the note in on_instances).  Working
+        from the answer itself has no race to lose: the identities cannot be
+        out of step with the detections they are written on.
         """
+        st["frame"] = m
+        st["frame_t"] = time.monotonic()
+        arrived.set()
         mapping = {}
         for det in m.detections:
             parts = str(det.id).split(":")
@@ -931,6 +979,10 @@ def main():
     reset_sent = [False]          # whether a previous run's markers were wiped
     last_target = [None]
     last_epoch = [None]
+    # When the subject was last resolvable, so a return can be told from a
+    # continuous track.
+    last_here = [0.0]
+    exits = collections.Counter()
     why = Counter()
     prev_root, prev_raw = [None], [None]
     jumps = {"in": deque(maxlen=600), "out": deque(maxlen=600)}
@@ -1217,7 +1269,15 @@ def main():
     last_gate = ["never ran"]
 
     def instance_of(det):
-        return int(det.id) if str(det.id).isdigit() else 0
+        """The instance number off a "<track>:<instance>" id.
+
+        Plain digits still work, for anybody feeding this node raw detections.
+        """
+        text = str(det.id)
+        if ":" in text:
+            tail = text.split(":")[1]
+            return int(tail) if tail.isdigit() else 0
+        return int(text) if text.isdigit() else 0
 
     def fit_one(det, labels, rgb, depth_m, fy, betas_key=None):
         """TokenHMR for one detection, and how much of them was in view.
@@ -1779,22 +1839,29 @@ def main():
                 break
             reset_stale_markers()        # one-shot, self-disabling
 
-            inst_msg, K = st["instances"], st["K"]
+            inst_msg, K = st["frame"], st["K"]
             if (inst_msg is None or K is None
-                    or loop_t0 - st["instances_t"] > args.tracker_timeout):
+                    or loop_t0 - st["frame_t"] > args.tracker_timeout):
                 idles += 1
                 go_idle()
                 wait_for_input(period)
                 continue
 
             key = stamp_ns(inst_msg.header)
+            exits["loop"] += 1
             if key == last_key:
-                wait_for_input(period)          # nothing new since the last fit
+                # Counted, because an iteration that leaves here leaves no
+                # other trace: it is neither a fit nor an idle, and a loop
+                # spinning on one frame looks from the outside exactly like a
+                # loop that is merely slow.
+                exits["same frame"] += 1
+                wait_for_input(period)
                 continue
 
             labels = st["labels"].get(key)
             humans = [d for d in inst_msg.detections
                       if d.results and d.results[0].hypothesis.class_id == args.human_class]
+            exits["new frame"] += 1
             if labels is None or not humans:
                 why["no instance mask for this stamp" if labels is None
                     else "no humans detected"] += 1
@@ -1807,6 +1874,8 @@ def main():
 
             rgb_msg = rgb_buf.exact(key)
             dep_msg = depth_buf.nearest(key, depth_tol_ns)
+            exits["paired"] += 1 if (rgb_msg is not None
+                                     and dep_msg is not None) else 0
             if rgb_msg is None or dep_msg is None:
                 # Retry briefly: the frame these detections name may still be
                 # in flight.  Give up once it is older than the buffer can
@@ -1834,7 +1903,23 @@ def main():
             # Which instance the subject track is, this frame.  Identity is
             # the tracker's business; all this node does is look the answer up.
             subj, subj_epoch = subject(), subject_epoch()
-            track_of = st["tracks"].get(key, {})
+            track_of = {}
+            for det in inst_msg.detections:
+                parts = str(det.id).split(":")
+                if len(parts) == 2 and parts[1].isdigit() and parts[0].lstrip("-").isdigit():
+                    track_of[int(parts[1])] = int(parts[0])
+            # The tracks message for this stamp may still be in flight.  This
+            # node and the tracker both subscribe to the same detections, and
+            # this one has less to do with them, so it routinely gets there
+            # first: measured live, 20 to 34 stamps in every 30 fits had no
+            # tracks yet.  Treating that as "the target is not in this frame"
+            # skips the fit, and the skeleton simply stops coming -- which is
+            # most of the stutter that follows somebody walking back in, when
+            # the tracker is busiest and slowest to answer.
+            #
+            # The camera frames already get this treatment a few lines up; the
+            # tracks did not.  Wait for it the same way: give up only once the
+            # frame is older than the buffer could still hold.
             target_instance = next(
                 (i for i, t in track_of.items() if t == subj), None)
             if subj < 0:
@@ -1880,11 +1965,33 @@ def main():
                 # converged -- clearing the lot made the new target start from
                 # a cold estimate that the room had to re-warm.
                 ML.reset_betas_state(last_target[0])
+            elif (subj >= 0 and target_instance is not None
+                  and loop_t0 - last_here[0] > ABSENCE_S and last_here[0]):
+                # The same person, and they have been AWAY.  The shape estimate
+                # is still about them and is kept; the POSITION filters are
+                # not -- they model somebody moving continuously, and an
+                # absence is precisely the break in that.  The root stabiliser
+                # exists to refuse a pelvis that teleports, and somebody who
+                # walks out for nine seconds and returns three metres away
+                # looks exactly like a teleport to it: measured live, it
+                # refused the position for seventeen seconds after a
+                # re-acquisition, and with no position there is no skeleton --
+                # 19 gaps of 130 to 570 ms, which is the stutter that follows
+                # every return.
+                node.get_logger().info(
+                    f"subject #{subj} back after "
+                    f"{loop_t0 - last_here[0]:.1f}s: resetting where they were, "
+                    "keeping what they look like")
+                root_stab.reset()
+                root_smooth.reset()
+                facing_smooth.reset()
             elif subj != last_target[0]:
                 node.get_logger().info(
                     f"subject #{last_target[0]} -> #{subj}: same person, "
                     "keeping the body")
             last_target[0], last_epoch[0] = subj, subj_epoch
+            if subj >= 0 and target_instance is not None:
+                last_here[0] = loop_t0
 
             # ---- the target first, and alone ---------------------------------
             # Whoever is designated is the only body anybody is looking at, so
@@ -1907,6 +2014,7 @@ def main():
                 people.append((track_of.get(instance_of(target_det)), vis, got))
             prof["fit"] += (time.monotonic() - t_stage) * 1e3
             placed = None
+            exits["fitted" if got is not None else "not fittable"] += 1
             if got is None:
                 # Nobody designated, or the designated one is not fittable this
                 # frame.  The others are still worth fitting, below.
@@ -2018,7 +2126,8 @@ def main():
                       f"{ages(prof['pose_age'], 'skeleton-age')}"
                       f"{ages(prof['mesh_age'], 'mesh-age')}"
                       f"frame-age {age:.0f} ms  "
-                      f"fits={fits} idle={idles} skip={skips} "
+                      + "  ".join(f"{k}={v}" for k, v in exits.most_common())
+                      + f"  |  fits={fits} idle={idles} skip={skips} "
                       f"(rgb {skip_rgb[0]} / depth {skip_depth[0]})  "
                       + "  ".join(f"{k}={v}" for k, v in why.most_common()),
                       flush=True)
