@@ -34,10 +34,10 @@ Measured on an RTX 4070 with two people in frame, camera stamp to the
 skeleton on the wire, not counting the camera driver's own 30-45 ms:
 51 ms median / 72 p90 headless, 66 / 77 with RViz attached.
 
-  in   /tracker/instances      vision_msgs/Detection2DArray -- the gate: class,
-                               score and instance id per detection
+  in   /tracker/tracks         vision_msgs/Detection2DArray -- the frame this
+                               node works on: the segmenter's detections with
+                               their identities, ids "<track>:<instance>"
        /tracker/instance_mask  16UC1, pixel = instance id, same stamp
-       /tracker/tracks         instance id to track id, as "<track>:<instance>"
        /tracker/target         std_msgs/Int32, the caregiver, -1 for none
        /tracker/patient        std_msgs/Int32, the second lock, -1 for none
        the camera's colour/depth/info topics, paired BY STAMP.
@@ -592,8 +592,6 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--instances", default="/tracker/instances",
-                    help="the gate: class, score and id per segmented instance")
     ap.add_argument("--instance-mask", default="/tracker/instance_mask",
                     help="16UC1, pixel = instance id, from the same frame")
     ap.add_argument("--tracks", default="/tracker/tracks",
@@ -766,7 +764,7 @@ def main():
     tf2_ros.TransformListener(tf_buffer, node)
 
     rgb_buf, depth_buf = StampBuffer(CAM_QUEUE), StampBuffer(CAM_QUEUE)
-    st = {"K": None, "cam_frame": None, "instances": None, "instances_t": 0.0,
+    st = {"K": None, "cam_frame": None,
           "hand_cm": {},
           "labels": {}, "tracks": {}, "target": -1, "epoch": None,
           "patient": -1, "patient_epoch": None,
@@ -804,34 +802,27 @@ def main():
     # interval on every frame, in the middle of the path being measured.
     arrived = threading.Event()
 
-    def on_instances(m):
-        st["instances"] = m
-        # PARKED: choosing the newest frame whose tracks have arrived, instead
-        # of the newest frame, was tried and is worse -- the loop then picks
-        # the same frame repeatedly and skips most iterations outright, and the
-        # skeleton fell from 17 Hz to 5.5.  The race it was aimed at is real
-        # and measured -- a third of frames reach this node before their tracks
-        # do -- but the fix for it is to drive this loop from /tracker/tracks,
-        # which carries the same detections WITH their identities and so cannot
-        # be out of step with itself.
-        #
-        # The newest frame's TRACKS
-        # are still in flight -- this node and the tracker subscribe to the
-        # same detections and this one has less to do with them, so it asks
-        # about two milliseconds before the answer is sent.  Taking the newest
-        # frame regardless meant a third of frames had no tracks, the target
-        # could not be resolved, and no skeleton was published: measured, both
-        # topics ran at 30 Hz while the skeleton came out at 17.
-        #
-        # Waiting for it is the wrong shape -- the newest stamp advances every
-        # 33 ms, so a deadline against it never matures and the loop fits
-        # nothing at all.  Choosing is the right shape: work on the newest
-        # frame whose tracks HAVE arrived, one frame behind at worst.  Instance
-        # ids are frame-local, so the alternative -- this frame's detections
-        # against last frame's tracks -- would credit one person's box to
-        # whoever held their number a moment ago.
-        st["instances_t"] = time.monotonic()
-        arrived.set()
+    # There is deliberately no subscription to /tracker/instances.  This node
+    # used to drive its loop from it and look identities up by stamp, and that
+    # is a race it cannot win: both nodes subscribe to the same detections and
+    # this one has less to do with them, so it asked about two milliseconds
+    # before the tracker had answered.  A third of frames found no tracks, the
+    # target could not be resolved, and nothing was published -- both topics
+    # ran at 30 Hz while the skeleton came out at 17.
+    #
+    # Two fixes were tried and are worse, recorded so they are not tried again.
+    # WAITING for the tracks is the wrong shape: the newest stamp advances
+    # every 33 ms and takes any deadline against it with it, so the loop fits
+    # nothing at all.  CHOOSING the newest frame whose tracks have arrived
+    # makes the loop pick the same frame repeatedly and skip most iterations
+    # outright -- 17 Hz to 5.5.
+    #
+    # Driving the loop from /tracker/tracks removes the race instead of
+    # racing better: that message carries the same detections WITH their
+    # identities, so it cannot be out of step with itself.  Instance ids are
+    # frame-local, which is why the other obvious shape -- this frame's
+    # detections against last frame's tracks -- is not available: it would
+    # credit one person's box to whoever held their number a moment ago.
 
     def on_labels(m):
         """The 16UC1 instance mask, kept by stamp beside its detections."""
@@ -855,7 +846,7 @@ def main():
         and published no skeleton -- 17 Hz out of 30.
         
         Waiting for the answer and choosing a frame that already has one were
-        both tried and are both worse (see the note in on_instances).  Working
+        both tried and are both worse (see the note above on_labels).  Working
         from the answer itself has no race to lose: the identities cannot be
         out of step with the detections they are written on.
         """
@@ -897,7 +888,6 @@ def main():
 
     from std_msgs.msg import Int32, Int32MultiArray
     from vision_msgs.msg import Detection2DArray
-    node.create_subscription(Detection2DArray, args.instances, on_instances, qos)
     node.create_subscription(Image, args.instance_mask, on_labels, cam_qos)
     node.create_subscription(Detection2DArray, args.tracks, on_tracks, cam_qos)
     node.create_subscription(Int32, args.target, on_target, 10)
@@ -935,7 +925,10 @@ def main():
     # deliberately throws away: the mesh then looks wrong against points
     # nothing is trying to match it to.
     pub_fit_cloud = node.create_publisher(PointCloud2, f"{ns}/fit_cloud", qos)
-    print(f"pose_from_tracker: {args.instances} -> {ns}/joints (everyone), "
+    # The loop's real input, which is the tracker's answer and not the
+    # question it was asked: a banner naming /tracker/instances sent anybody
+    # debugging a silent node to a topic this node no longer reads.
+    print(f"pose_from_tracker: {args.tracks} -> {ns}/joints (everyone), "
           f"{ns}/human_{{pose,mesh,facing,joints}} (the subject: "
           f"{args.patient} when it names somebody, else {args.target})",
           flush=True)
