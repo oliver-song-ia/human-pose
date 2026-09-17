@@ -213,6 +213,31 @@ def posture_extent_m(verts: np.ndarray) -> float:
     return float(max(np.ptp(v[:, 1]), np.ptp(v[:, 0])))
 
 
+def _dump_refused(where, n, rgb, mask, box, height, fill):
+    """Write the crop of a target the height gate turned away.
+
+    Numbers alone cannot separate "half of them really is behind a desk" from
+    "the measure is wrong about a whole person", and the second is what a bar
+    in the wrong place looks like from the inside.  Best effort: a diagnostic
+    that can throw is worse than no diagnostic.
+    """
+    import cv2
+    try:
+        d = Path(where); d.mkdir(parents=True, exist_ok=True)
+        x0, y0, x1, y1 = (int(max(0, box[0])), int(max(0, box[1])),
+                          int(box[2]), int(box[3]))
+        crop = rgb[y0:y1, x0:x1]
+        if crop.size == 0:
+            return
+        m = mask[y0:y1, x0:x1].astype(bool)
+        shown = crop.copy()
+        shown[~m] = (shown[~m] * 0.35).astype(shown.dtype)   # dim what is not them
+        cv2.imwrite(str(d / f"{n:05d}_h{height:.2f}_f{fill:.2f}.jpg"),
+                    shown[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 85])
+    except Exception:
+        pass
+
+
 def visible_height_fraction(mask: np.ndarray, depth_m: np.ndarray,
                             fy: float, body_m: float = PERSON_HEIGHT_M) -> float:
     """How much of a person's own length is in view, 1.0 for all of them.
@@ -581,13 +606,25 @@ def main():
     ap.add_argument("--target", default="/tracker/target",
                     help="the track id whose body is grounded, refined and "
                          "drawn; everyone else gets joints only")
-    ap.add_argument("--min-visible-height", type=float, default=0.50,
+    ap.add_argument("--min-visible-height", type=float, default=0.40,
                     help="skip anybody less of whose own length is in view "
                          "than this, measured against how tall a person is at "
                          "the distance depth puts them.  Real people read "
                          "0.65-0.70 here, seated ones included; a head-sized "
                          "fragment reads 0.12, and fitting one hands TokenHMR "
-                         "a crop it can only hallucinate a body from")
+                         "a crop it can only hallucinate a body from.  This "
+                         "and the tracker's MIN_BODY_FRACTION measure the "
+                         "same quantity, and a target between them is "
+                         "followed and locked but never drawn -- which is "
+                         "what a viewer reports as the pose vanishing while "
+                         "they walk past the lens.  Measured over one 133 s "
+                         "run, of the frames the target was in: 0.50 drew "
+                         "65%% of them, 0.40 drew 77%%, 0.30 drew 86%%.  The "
+                         "last step is not free -- model-against-depth "
+                         "disagreement p90 goes 19 -> 33 cm and the "
+                         "frame-to-frame z step p95 4.9 -> 8.4 cm, which is "
+                         "the skeleton shuttling along the camera axis.  0.40 "
+                         "buys most of the coverage at none of that")
     ap.add_argument("--max-occlusion", type=float, default=0.8,
                     help="skip the fit for anybody hidden by more than this "
                          "fraction of what an unoccluded person's mask covers")
@@ -1267,6 +1304,18 @@ def main():
         facing_smooth.reset()
 
     last_gate = ["never ran"]
+    # What the height gate is actually seeing, mirroring the tracker's
+    # [Scale] line.  The two measure the same quantity against different
+    # bars -- the tracker will follow 30% of a body, this node refuses to fit
+    # under --min-visible-height -- and a target sitting in the band between
+    # them is tracked, locked, and never drawn.  Without this the band is
+    # invisible: the gate reports that it closed, never how far under.
+    height_seen = collections.deque(maxlen=900)
+    # Set POSE_DUMP_REFUSED=<dir> to also write the crop of every Nth refused
+    # target.  A reading cannot say whether half a person is genuinely hidden
+    # or the measure is wrong about a whole one; the picture can.
+    dump_dir = os.environ.get("POSE_DUMP_REFUSED")
+    dumped = [0]
 
     def instance_of(det):
         """The instance number off a "<track>:<instance>" id.
@@ -1302,6 +1351,7 @@ def main():
         fill = visible_fraction(px, area)
         height = visible_height_fraction(mask, depth_m, fy)
         visible = min(fill, height)
+        height_seen.append(height)
         # Which gate, not just that one of them closed.  A bystander whose
         # skeleton comes and goes is one of these firing intermittently, and
         # they call for different answers: a mask that keeps dropping under
@@ -1315,6 +1365,9 @@ def main():
             return visible, None
         if height < args.min_visible_height:
             last_gate[0] = "under --min-visible-height"
+            if dump_dir and dumped[0] % 40 == 0:
+                _dump_refused(dump_dir, dumped[0], rgb, mask, box, height, fill)
+            dumped[0] += 1
             return visible, None
         last_gate[0] = "ok"
         verts, joints, pelvis_px, sigma = ML.run_tokenhmr(
@@ -2018,8 +2071,17 @@ def main():
             if got is None:
                 # Nobody designated, or the designated one is not fittable this
                 # frame.  The others are still worth fitting, below.
+                # WHICH gate closed, not just that the frame was lost.  The
+                # bystanders' reasons were named below and the target's --
+                # the only one anybody is watching -- was not, so 654 lost
+                # frames in one run carried no reason at all.  They call for
+                # opposite answers: a mask falling under --min-mask-px is a
+                # segmentation problem, a height hovering at
+                # --min-visible-height is a threshold in the wrong place, and
+                # a target missing from the frame is neither.
                 if subj >= 0 and target_instance is not None:
-                    why["target too hidden to fit"] += 1
+                    why[f"target {last_gate[0]}" if target_det is not None
+                        else "target not in this frame"] += 1
                 idles += 1
                 go_idle()
             else:
@@ -2132,6 +2194,17 @@ def main():
                       + "  ".join(f"{k}={v}" for k, v in why.most_common()),
                       flush=True)
                 why.clear()
+                if len(height_seen) >= 300:
+                    hs = np.asarray(height_seen)
+                    print(f"[Visible] how much of a body the height gate saw: "
+                          f"p1 {np.percentile(hs, 1):.2f} "
+                          f"p5 {np.percentile(hs, 5):.2f} "
+                          f"p50 {np.median(hs):.2f} "
+                          f"p95 {np.percentile(hs, 95):.2f}  (bar "
+                          f"{args.min_visible_height:.2f}, "
+                          f"{float((hs < args.min_visible_height).mean()) * 100:.1f}"
+                          f"% under)", flush=True)
+                    height_seen.clear()
                 if len(fit_dz) > 10:
                     dz = np.asarray(fit_dz) * 100
                     mt = np.asarray(fit_match) * 100
