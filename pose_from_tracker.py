@@ -1962,6 +1962,13 @@ def main():
             rgb = np.ascontiguousarray(PIPE.decode(rgb_msg))
             depth_m = PIPE.decode_depth(dep_msg)
             if not (depth_m.shape[:2] == rgb.shape[:2] == labels.shape[:2]):
+                # Counted, because this is the one exit that used to leave no
+                # trace at all: a throttled warning and nothing in the tallies,
+                # so the loop reported 566 frames paired and zero fitted with
+                # nothing in between to say where they went.  Unregistered
+                # depth puts every frame here, and it is a camera setting
+                # rather than anything this node can recover from.
+                exits["depth not registered to colour"] += 1
                 node.get_logger().warn(
                     f"shape mismatch colour {rgb.shape[:2]} depth "
                     f"{depth_m.shape[:2]} mask {labels.shape[:2]}; depth must "
