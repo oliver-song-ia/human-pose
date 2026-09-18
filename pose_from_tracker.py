@@ -113,6 +113,25 @@ sys.path.insert(0, str(HERE))
 import live_pipeline as PIPE
 import mesh_live_o3d as ML
 
+# The size test is shared with the tracker, ON PURPOSE and from one definition.
+# The two used to have their own, and they had drifted into measuring
+# different things while being described as the same: one took the vertical
+# extent, the other the longer of the two axes discounted by coverage, and
+# both were compared against the height of a standing person.  A number that
+# two nodes must agree on cannot live in two files.
+#
+# Imported rather than copied, from the parent repository, and a copy is
+# deliberately NOT provided as a fallback -- a fallback is how the two drifted
+# in the first place.  Running this node outside the repository needs
+# SEMANTIC_NODES to say where nodes/ is.
+_NODES = Path(os.environ.get("SEMANTIC_NODES", HERE.parent / "nodes"))
+if not (_NODES / "utils.py").is_file():
+    raise SystemExit(
+        f"cannot find the shared size test: no utils.py in {_NODES}. "
+        "Set SEMANTIC_NODES to the repository's nodes/ directory.")
+sys.path.insert(0, str(_NODES))
+from utils import KEEP_LENGTH_M, KEEP_WIDTH_M, person_sized
+
 # Which axis points at the sky, per output frame.  A camera OPTICAL frame is
 # x right, y DOWN, z forward, so up there is -y; the floor-aligned world frame
 # has z up.  Getting this wrong does not move the heading -- that is the
@@ -1321,7 +1340,7 @@ def main():
             return int(tail) if tail.isdigit() else 0
         return int(text) if text.isdigit() else 0
 
-    def fit_one(det, labels, rgb, depth_m, fy, betas_key=None):
+    def fit_one(det, labels, rgb, depth_m, fx, fy, betas_key=None):
         """TokenHMR for one detection, and how much of them was in view.
 
         Returns (visible, fit).  `visible` is the more limiting of the two
@@ -1344,7 +1363,14 @@ def main():
         fill = visible_fraction(px, area)
         height = visible_height_fraction(mask, depth_m, fy)
         visible = min(fill, height)
-        height_seen.append(height)
+        # Measured once, before any gate, so the histogram records what the
+        # size test saw on EVERY body -- including the ones an earlier gate
+        # turns away.  A distribution that only contains what got past the
+        # other gates cannot say where this one belongs.
+        keep_size, length, width = person_sized(mask.astype(bool), depth_m,
+                                                fx, fy)
+        if length is not None:
+            height_seen.append((length, width))
         # Which gate, not just that one of them closed.  A bystander whose
         # skeleton comes and goes is one of these firing intermittently, and
         # they call for different answers: a mask that keeps dropping under
@@ -1356,8 +1382,15 @@ def main():
         if fill < 1.0 - args.max_occlusion:
             last_gate[0] = "over --max-occlusion"
             return visible, None
-        if height < args.min_visible_height:
-            last_gate[0] = "under --min-visible-height"
+        # Two dimensions, one shared definition with the tracker.  This used to
+        # be a fraction of a standing person, which caps a seated one near 0.6
+        # however clearly they are seen and reads somebody lying down as
+        # almost nothing -- so the bar had to sit just above the noise, and
+        # people who were plainly visible were refused for their posture.
+        if not keep_size:
+            last_gate[0] = (f"under {KEEP_LENGTH_M:.1f} m long AND "
+                            f"{KEEP_WIDTH_M:.1f} m wide "
+                            f"(measured {length:.2f} x {width:.2f})")
             if dump_dir and dumped[0] % 40 == 0:
                 _dump_refused(dump_dir, dumped[0], rgb, mask, box, height, fill)
             dumped[0] += 1
@@ -2081,9 +2114,10 @@ def main():
 
             t_stage = time.monotonic()
             bodies = []
+            fx = float(K[0, 0]) if K is not None else 0.0
             fy = float(K[1, 1]) if K is not None else 0.0
             people = []                      # (instance, visible, fit or None)
-            vis, got = (fit_one(target_det, labels, rgb, depth_m, fy,
+            vis, got = (fit_one(target_det, labels, rgb, depth_m, fx, fy,
                                 betas_key=track_of.get(instance_of(target_det)))
                         if target_det else (0.0, None))
             if target_det is not None:
@@ -2166,7 +2200,7 @@ def main():
                     if tid is None:
                         why["bystander has no track id"] += 1
                         continue
-                    vis, other = fit_one(det, labels, rgb, depth_m, fy,
+                    vis, other = fit_one(det, labels, rgb, depth_m, fx, fy,
                                          betas_key=tid)
                     if other is None:
                         why[f"bystander {last_gate[0]}"] += 1
@@ -2219,14 +2253,16 @@ def main():
                 why.clear()
                 if len(height_seen) >= 300:
                     hs = np.asarray(height_seen)
-                    print(f"[Visible] how much of a body the height gate saw: "
-                          f"p1 {np.percentile(hs, 1):.2f} "
-                          f"p5 {np.percentile(hs, 5):.2f} "
-                          f"p50 {np.median(hs):.2f} "
-                          f"p95 {np.percentile(hs, 95):.2f}  (bar "
-                          f"{args.min_visible_height:.2f}, "
-                          f"{float((hs < args.min_visible_height).mean()) * 100:.1f}"
-                          f"% under)", flush=True)
+                    print(f"[Visible] how big the size gate saw people: "
+                          f"length p5 {np.percentile(hs[:, 0], 5):.2f} "
+                          f"p50 {np.median(hs[:, 0]):.2f} "
+                          f"p95 {np.percentile(hs[:, 0], 95):.2f}  |  "
+                          f"width p5 {np.percentile(hs[:, 1], 5):.2f} "
+                          f"p50 {np.median(hs[:, 1]):.2f} "
+                          f"p95 {np.percentile(hs[:, 1], 95):.2f}  m  (bars "
+                          f"{KEEP_LENGTH_M:.1f} / {KEEP_WIDTH_M:.1f}, "
+                          f"{float(((hs[:, 0] < KEEP_LENGTH_M) & (hs[:, 1] < KEEP_WIDTH_M)).mean()) * 100:.1f}"
+                          f"% under both)", flush=True)
                     height_seen.clear()
                 if len(fit_dz) > 10:
                     dz = np.asarray(fit_dz) * 100
